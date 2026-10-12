@@ -46,6 +46,8 @@ HUMAN_HINTS = {
     "YouBlockedUserError": "Is Telegram account ne DiskWala bot ko BLOCK kiya hua hai. Wahi account (jiska TELEGRAM_SESSION_STRING hai) "
                            "Telegram app me kholo -> bot ki chat -> Unblock / Restart. Phir `resume`.",
     "UserIsBlockedError": "Us user/bot ne is account ko block kiya hai. Telegram me check karo.",
+    "AuthKeyDuplicatedError": "Same Telegram session do jagah/IP se ek saath chali: Telegram ne key permanently kill kar di. "
+                              "Naya login + export-session karo.",
     "AuthKeyUnregisteredError": "Telegram session invalid ho gaya. Naya `export-session` karke TELEGRAM_SESSION_STRING update karo.",
     "SessionRevokedError": "Telegram session revoke ho gaya. Naya `export-session` karke TELEGRAM_SESSION_STRING update karo.",
     "UserDeactivatedError": "Telegram account deactivated hai.",
@@ -57,6 +59,31 @@ HUMAN_HINTS = {
     "PeerIdInvalidError": "Telegram ne chat/channel id reject ki: FILE_MANAGER_CHANNEL_ID / FINAL_POST_DESTINATION_ID check karo.",
 }
 NEEDS_HUMAN = frozenset(HUMAN_HINTS)
+
+# Session hi mar gayi: retry/pause bekaar hai, job ka koi kasoor nahi. Worker ruk jaata hai, job jaisi thi waisi rehti hai.
+SESSION_DEAD = frozenset({"AuthKeyDuplicatedError", "AuthKeyUnregisteredError", "SessionRevokedError", "SessionExpiredError"})
+SESSION_HELP = (
+    "Telegram session string dead hai (ek hi session do jagah/IP se ek saath chali, ya revoke ho gayi). "
+    "FIX: 1) Jahan bhi purani session chal rahi hai wahan band karo (Termux/local, Replit, purana Koyeb/Render instance) "
+    "aur local workspace/sessions/*.session file delete karo. "
+    "2) Ek hi jagah naya login: `python -m src.main login`, phir `python -m src.app export-session`. "
+    "3) Nayi string TELEGRAM_SESSION_STRING me daalo aur redeploy karo. "
+    "4) Agar koi ZIP PAUSED dikhe: `python -m src.app resume <ID>`."
+)
+
+
+def is_session_dead(e: BaseException | None) -> bool:
+    seen = 0
+    while e is not None and seen < 5:  # cause/context chain bhi dekho
+        if type(e).__name__ in SESSION_DEAD:
+            return True
+        e = e.__cause__ or e.__context__
+        seen += 1
+    return False
+
+
+class SessionDead(Exception):
+    """Telegram session unusable. Pause/FAIL nahi hota; worker ruk jaata hai."""
 
 
 def needs_human(e: BaseException) -> bool:
@@ -146,9 +173,17 @@ class Worker:
         self._crashes: dict[str, int] = {}
         self._job_cancelled = False
         self.max_crashes = 5
+        self.fatal: BaseException | None = None  # session dead hui to yahan; run_worker exit code 3 deta hai
 
     # ------------------------------------------------------------------ loop
     def stop(self) -> None:
+        self.stop_event.set()
+
+    def _fatal(self, e: BaseException) -> None:
+        if self.fatal is None:  # sirf ek baar log (pehle har 30s par spam hota tha)
+            self.fatal = e
+            log.error("Telegram session dead: %s: %s", type(e).__name__, e)
+            log.error(SESSION_HELP)
         self.stop_event.set()
 
     def _check_stop(self) -> None:
@@ -183,7 +218,18 @@ class Worker:
             if info.get("new"):
                 log.info("%s naye ZIP queue me.", info["new"])
         except Exception as e:  # noqa: BLE001 - scan fail ho to bhi purani queue chalti rahe
+            if is_session_dead(e):
+                self._fatal(e)
+                return False
             log.warning("Channel scan fail (%s: %s). Agli baar dobara.", type(e).__name__, e)
+            try:
+                if self.ports.ensure_connected:
+                    await self.ports.ensure_connected()
+            except Exception as ce:  # noqa: BLE001
+                if is_session_dead(ce):
+                    self._fatal(ce)
+                    return False
+                log.warning("Reconnect fail: %s", ce)
         sel = self.repo.next_job()
         if sel.blocked_by:
             b = sel.blocked_by
@@ -199,6 +245,9 @@ class Worker:
             if self.stop_event.is_set():
                 return True
             raise
+        except SessionDead as e:
+            self._fatal(e.__cause__ or e)
+            return False
         except Exception as e:  # noqa: BLE001 - worker kabhi crash-loop me na jaye; state DB me safe hai
             n = self._crashes[aid] = self._crashes.get(aid, 0) + 1
             log.exception("[%s] Unexpected error (%s/%s): %s", aid, n, self.max_crashes, e)
@@ -263,6 +312,9 @@ class Worker:
         except StopRequested:
             log.info("[%s] Stop request: state DB me safe hai, restart par yahin se resume.", aid)
             return "stopped"
+        except SessionDead:
+            log.warning("[%s] Session dead: job pause nahi ki, naya session lagane ke baad wahin se chalegi.", aid)
+            raise
         except asyncio.CancelledError:
             log.info("[%s] Cancel: state DB me safe hai.", aid)
             raise
@@ -276,6 +328,8 @@ class Worker:
             log.error("[%s] FAILED: %s", aid, e)
             return "failed"
         except Exception as e:  # noqa: BLE001
+            if is_session_dead(e):
+                raise SessionDead(str(e)) from e
             if not needs_human(e):
                 raise  # asli bug/unknown: run_once ka crash guard sambhalega
             reason = explain(f"{type(e).__name__}: {e}")  # retry bekaar hai: turant pause + saaf instruction
@@ -380,6 +434,8 @@ class Worker:
         except ArchiveGone as e:
             raise StagePermanent(str(e)) from e
         except DownloadError as e:
+            if is_session_dead(e):
+                raise SessionDead(str(e)) from e
             msg = str(e)
             if "bohot bada" in msg:
                 raise StagePermanent(msg) from e
@@ -389,6 +445,8 @@ class Worker:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
+            if is_session_dead(e):
+                raise SessionDead(str(e)) from e
             secs = flood_seconds(e)
             if secs is not None:
                 raise StageTransient(f"Telegram FloodWait {secs}s", delay=secs + 1) from e
