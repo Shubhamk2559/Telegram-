@@ -23,11 +23,12 @@ import logging
 import re
 import signal
 import sys
+import types
 from pathlib import Path
 
 from .app_config import AppConfig, load_app_config
 from .config import ConfigError
-from .db import Database, DBError, migrate
+from .db import Database, DBError, Lease, migrate
 from .db_stores import PostStore
 from .jobs import JobError, JobRepo
 from .legacy_import import import_legacy
@@ -56,19 +57,29 @@ def make_client(cfg: AppConfig):
 
 async def connect_client(cfg: AppConfig, factory=None, timeout: float = 90.0):
     """Connect + authorize. Network na ho to 90s baad saaf error (warna Telethon ke infinite retry me atka rehta)."""
+    from .worker import SESSION_HELP, is_session_dead
     client = (factory or make_client)(cfg)
     try:
         await asyncio.wait_for(client.connect(), timeout)
+        authorized = await client.is_user_authorized()
     except asyncio.TimeoutError as e:
         raise ConfigError(f"Telegram se {timeout:.0f}s me connect nahi ho paya (network/DC?).") from e
-    if not await client.is_user_authorized():
+    except Exception as e:  # noqa: BLE001
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        if is_session_dead(e):
+            raise ConfigError(f"{type(e).__name__}: {e}. {SESSION_HELP}") from e
+        raise
+    if not authorized:
         await client.disconnect()
         raise ConfigError("Telegram session authorized nahi hai. Local par `python -m src.main login` karke "
                           "`python -m src.app export-session` se TELEGRAM_SESSION_STRING set karo.")
     return client
 
 
-async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client):
+async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, lease: Lease | None = None):
     from .channel_reader import ZipMessage, download_zip, resolve_channel
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
@@ -110,7 +121,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client):
         make_uploader=lambda store: StrictVideoUploader(bot, store, cfg.uploader, policy=cfg.video_policy),
         publisher=PostPublisher(TelethonDestination(client, dest.entity, cfg.link_preview), PostStore(db), cfg.publish_policy),
         ensure_connected=ensure_connected)
-    return Worker(db, repo, cfg.worker, ports)
+    return Worker(db, repo, cfg.worker, ports, lease=lease)
 
 
 def ensure_token_db(client, env_token: str, repo: JobRepo, author: str = "") -> None:
@@ -140,6 +151,24 @@ def install_signal_handlers(loop, worker, sigs=(signal.SIGTERM, signal.SIGINT)) 
     return done
 
 
+async def acquire_lease(lease: Lease, stop: asyncio.Event, poll: float = 5.0) -> bool:
+    """Telegram se connect hone SE PEHLE lease lo. Rolling deploy me purana instance jab tak chal raha hai, naya
+    wait karta hai: warna ek hi session do IP se judti hai aur Telegram AuthKeyDuplicatedError de kar key maar deta hai."""
+    announced = False
+    while not stop.is_set():
+        if lease.acquire():
+            return True
+        if not announced:
+            log.warning("Purana worker abhi active hai (%s). Same Telegram session do jagah nahi chal sakti, isliye "
+                        "uske band hone ka wait kar raha hoon (max ~%.0fs).", lease.holder(), lease.ttl)
+            announced = True
+        try:
+            await asyncio.wait_for(stop.wait(), poll)
+        except asyncio.TimeoutError:
+            pass
+    return False
+
+
 async def run_worker(cfg: AppConfig, *, client_factory=None) -> int:
     from .health import HealthServer
     from .preflight import ERROR, format_checks, preflight
@@ -157,20 +186,32 @@ async def run_worker(cfg: AppConfig, *, client_factory=None) -> int:
         health.start()
         log.info("Health endpoint port %s par.", health.port)
     client = None
+    code = 0
+    lease = Lease(db, ttl=cfg.worker.lease_ttl)
+    pre_stop = asyncio.Event()  # lease-wait ke dauran SIGTERM par nikalne ke liye
+    install_signal_handlers(asyncio.get_running_loop(), types.SimpleNamespace(stop=pre_stop.set))
     try:
+        if not await acquire_lease(lease, pre_stop):
+            return 0
         client = await connect_client(cfg, client_factory)
-        worker = await build_worker(cfg, db, repo, client)
+        worker = await build_worker(cfg, db, repo, client, lease=lease)
         if health:
             health.worker = worker
         install_signal_handlers(asyncio.get_running_loop(), worker)
         await worker.run_forever()
+        if worker.fatal is not None:
+            code = 3  # session dead: restart se theek nahi hoga, naya TELEGRAM_SESSION_STRING chahiye
     finally:
+        lease.release()
         if health:
             health.stop()
         if client:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
         db.close()
-    return 0
+    return code
 
 
 # --------------------------------------------------------------------------- simple commands
