@@ -1,0 +1,13 @@
+.env
+*.session
+*.session-journal
+workspace/sessions/*
+workspace/downloads/*
+workspace/extracted/*
+workspace/manifests/*
+workspace/selftest/
+!workspace/*/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+venv/

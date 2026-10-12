@@ -1,0 +1,23 @@
+# Secrets / state kabhi image me nahi jaane chahiye
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+workspace/
+*.zip
+
+# Dev files
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+tests/
+docs/
+.idea
+.vscode
+.dockerignore
+Dockerfile
+README.md

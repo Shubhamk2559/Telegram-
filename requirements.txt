@@ -1,0 +1,5 @@
+telethon>=1.36
+python-dotenv>=1.0
+qrcode>=7.4
+# Production database (PostgreSQL). SQLite local/dev ke liye built-in hai.
+psycopg[binary]>=3.1,<4
