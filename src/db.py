@@ -205,6 +205,9 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
             expires_at DOUBLE PRECISION NOT NULL
         )""",
     ]),
+    (2, "posts_sending_started_at", [
+        "ALTER TABLE posts ADD COLUMN sending_started_at TEXT",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
