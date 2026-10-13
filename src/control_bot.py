@@ -48,16 +48,33 @@ def load_bot_settings(env=os.environ) -> BotSettings:
     return BotSettings(token=token, admins=admins, password=pw)
 
 
+def _png_from_matrix(matrix, scale: int = 10) -> bytes:
+    """Bina Pillow ke grayscale PNG (zlib + struct). matrix: list of rows, True = kala module."""
+    import struct
+    import zlib
+    n = len(matrix)
+    raw = bytearray()
+    for r in matrix:
+        line = b"".join((b"\x00" if v else b"\xff") * scale for v in r)
+        raw += (b"\x00" + line) * scale  # filter byte 0 + pixels, scale baar repeat
+    w = n * scale
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, w, 8, 0, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
 def make_qr_png(url: str) -> bytes | None:
     try:
         import qrcode
-        q = qrcode.QRCode(border=3, box_size=10)
+        q = qrcode.QRCode(border=4, box_size=1)
         q.add_data(url)
         q.make(fit=True)
-        buf = io.BytesIO()
-        q.make_image(fill_color="black", back_color="white").save(buf)
-        return buf.getvalue()
-    except Exception:  # noqa: BLE001 - Pillow nahi hai: sirf link bhejenge
+        return _png_from_matrix(q.get_matrix(), 10)
+    except Exception as e:  # noqa: BLE001 - qrcode hi nahi hai: sirf link bhejenge
+        log.warning("QR image nahi bani (%s: %s): sirf link bhej raha hoon.", type(e).__name__, e)
         return None
 
 
