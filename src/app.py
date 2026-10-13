@@ -23,7 +23,6 @@ import logging
 import re
 import signal
 import sys
-import types
 from pathlib import Path
 
 from .app_config import AppConfig, load_app_config
@@ -31,6 +30,7 @@ from .config import ConfigError
 from .db import Database, DBError, Lease, migrate
 from .db_stores import PostStore
 from .jobs import JobError, JobRepo
+from .supervisor import acquire_lease  # noqa: F401 - app.acquire_lease naam bhi chalta rahe
 from .legacy_import import import_legacy
 from .reports_zip import overall_report, zip_report
 
@@ -57,6 +57,7 @@ def make_client(cfg: AppConfig):
 
 async def connect_client(cfg: AppConfig, factory=None, timeout: float = 90.0):
     """Connect + authorize. Network na ho to 90s baad saaf error (warna Telethon ke infinite retry me atka rehta)."""
+    from .supervisor import SessionUnusable
     from .worker import SESSION_HELP, is_session_dead
     client = (factory or make_client)(cfg)
     try:
@@ -70,16 +71,29 @@ async def connect_client(cfg: AppConfig, factory=None, timeout: float = 90.0):
         except Exception:  # noqa: BLE001
             pass
         if is_session_dead(e):
-            raise ConfigError(f"{type(e).__name__}: {e}. {SESSION_HELP}") from e
+            raise SessionUnusable(f"{type(e).__name__}: {e}. {SESSION_HELP}") from e
         raise
     if not authorized:
         await client.disconnect()
-        raise ConfigError("Telegram session authorized nahi hai. Local par `python -m src.main login` karke "
-                          "`python -m src.app export-session` se TELEGRAM_SESSION_STRING set karo.")
+        raise SessionUnusable("Telegram session authorized nahi hai (logout/revoke ho gayi). Bot me /login karo.")
     return client
 
 
-async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, lease: Lease | None = None):
+class _Tracked:
+    """download_zip sirf client.download_media use karta hai: usme live-progress callback jod do (download_zip ko chhue bina)."""
+
+    def __init__(self, client, cb):
+        self._c, self._cb = client, cb
+
+    async def download_media(self, message, file=None, progress_callback=None, **kw):
+        def both(done, total):
+            self._cb(done, total)
+            if progress_callback:
+                progress_callback(done, total)
+        return await self._c.download_media(message, file=file, progress_callback=both, **kw)
+
+
+async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, lease: Lease | None = None, live=None):
     from .channel_reader import ZipMessage, download_zip, resolve_channel
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
@@ -107,7 +121,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         if not msg or not getattr(msg, "file", None):
             raise ArchiveGone(f"ZIP message {job['message_id']} channel me ab nahi hai.")
         z = ZipMessage(job["message_id"], job["filename"], int(msg.file.size or job["size"] or 0), msg.date, msg)
-        return await download_zip(client, source, z, s)
+        return await download_zip(_Tracked(client, live.on_download) if live else client, source, z, s)
 
     async def ensure_connected():
         if not client.is_connected():
@@ -118,7 +132,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         download=download,
         imgbb=ImgBBClient(s.imgbb_api_key, http, max_retries=s.imgbb_retries),
         telegraph=tg, http=http,
-        make_uploader=lambda store: StrictVideoUploader(bot, store, cfg.uploader, policy=cfg.video_policy),
+        make_uploader=lambda store: StrictVideoUploader(bot, store, cfg.uploader, policy=cfg.video_policy, ui=live),
         publisher=PostPublisher(TelethonDestination(client, dest.entity, cfg.link_preview), PostStore(db), cfg.publish_policy),
         ensure_connected=ensure_connected)
     return Worker(db, repo, cfg.worker, ports, lease=lease)
@@ -151,65 +165,51 @@ def install_signal_handlers(loop, worker, sigs=(signal.SIGTERM, signal.SIGINT)) 
     return done
 
 
-async def acquire_lease(lease: Lease, stop: asyncio.Event, poll: float = 5.0) -> bool:
-    """Telegram se connect hone SE PEHLE lease lo. Rolling deploy me purana instance jab tak chal raha hai, naya
-    wait karta hai: warna ek hi session do IP se judti hai aur Telegram AuthKeyDuplicatedError de kar key maar deta hai."""
-    announced = False
-    while not stop.is_set():
-        if lease.acquire():
-            return True
-        if not announced:
-            log.warning("Purana worker abhi active hai (%s). Same Telegram session do jagah nahi chal sakti, isliye "
-                        "uske band hone ka wait kar raha hoon (max ~%.0fs).", lease.holder(), lease.ttl)
-            announced = True
-        try:
-            await asyncio.wait_for(stop.wait(), poll)
-        except asyncio.TimeoutError:
-            pass
-    return False
-
-
 async def run_worker(cfg: AppConfig, *, client_factory=None) -> int:
+    from .control_bot import ControlBot, load_bot_settings
     from .health import HealthServer
-    from .preflight import ERROR, format_checks, preflight
+    from .preflight import ERROR, OK, Check, format_checks, preflight
+    from .supervisor import Supervisor
     db, repo = _open(cfg)
+    bs = load_bot_settings()
     checks = preflight(cfg, check_db=False)
+    if bs.enabled:  # session ab bot ke /login se aa sakti hai: env me hona zaroori nahi
+        checks = [c for c in checks if c.name != "session"]
+        checks.append(Check(OK, "control_bot", f"BOT_TOKEN set hai, admins: {len(bs.admins)}"
+                            + ("" if bs.admins else " (ADMIN_IDS khaali: bot ko /start bhejo, wo tumhari ID batayega)")))
     for line in format_checks(checks).splitlines():
         log.info("preflight %s", line)
     if any(c.level == ERROR for c in checks):
         log.error("Preflight fail: upar [FAIL] lines theek karo. `python -m src.app doctor` se dobara dekho.")
         db.close()
         return 2
+    if db.kind == "sqlite":
+        log.warning("DATABASE SQLite hai: redeploy par queue/login reset hoga aur do instance ek session ek saath chala sakte hain "
+                    "(lease sirf PostgreSQL me instances ke beech kaam karti hai). DATABASE_URL me PostgreSQL do.")
+    lease = Lease(db, ttl=cfg.worker.lease_ttl)
+    sup = Supervisor(cfg, db, repo, lease, connect=connect_client, build=build_worker, client_factory=client_factory,
+                     bot_enabled=bs.enabled)
     health = None
-    if cfg.health_enabled:  # PEHLE start: Koyeb health check Telegram connect hone se pehle bhi pass hona chahiye
-        health = HealthServer(cfg.health_port, db)
+    if cfg.health_enabled:  # PEHLE start: health check Telegram/login se pehle bhi pass hona chahiye
+        health = HealthServer(cfg.health_port, db, sup)
         health.start()
         log.info("Health endpoint port %s par.", health.port)
-    client = None
+    install_signal_handlers(asyncio.get_running_loop(), sup)
+    bot = None
     code = 0
-    lease = Lease(db, ttl=cfg.worker.lease_ttl)
-    pre_stop = asyncio.Event()  # lease-wait ke dauran SIGTERM par nikalne ke liye
-    install_signal_handlers(asyncio.get_running_loop(), types.SimpleNamespace(stop=pre_stop.set))
     try:
-        if not await acquire_lease(lease, pre_stop):
+        if not await acquire_lease(lease, sup.stop_event):  # Telegram/bot se judne SE PEHLE
             return 0
-        client = await connect_client(cfg, client_factory)
-        worker = await build_worker(cfg, db, repo, client, lease=lease)
-        if health:
-            health.worker = worker
-        install_signal_handlers(asyncio.get_running_loop(), worker)
-        await worker.run_forever()
-        if worker.fatal is not None:
-            code = 3  # session dead: restart se theek nahi hoga, naya TELEGRAM_SESSION_STRING chahiye
+        if bs.enabled:
+            bot = ControlBot(cfg, bs, sup)
+            await bot.start()
+        code = await sup.run()
     finally:
+        if bot:
+            await bot.stop()
         lease.release()
         if health:
             health.stop()
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
         db.close()
     return code
 
