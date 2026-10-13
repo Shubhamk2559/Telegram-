@@ -174,10 +174,22 @@ class Worker:
         self._job_cancelled = False
         self.max_crashes = 5
         self.fatal: BaseException | None = None  # session dead hui to yahan; run_worker exit code 3 deta hai
+        self._task: asyncio.Task | None = None
+        self.on_job: Callable[[str | None], None] | None = None  # bot ka live-progress hook (job shuru/khatam)
 
     # ------------------------------------------------------------------ loop
     def stop(self) -> None:
         self.stop_event.set()
+
+    def cancel_current(self) -> str | None:
+        """Chal rahi ZIP turant cancel (heartbeat ka ~40s wait nahi). Returns archive_id, ya None agar kuch chal hi nahi raha."""
+        aid, task = self.current, self._task
+        if not aid or task is None or task.done():
+            return None
+        self.repo.cancel(aid)  # FAILED + CANCELLED (requeue se wapas aa sakti hai)
+        self._job_cancelled = True
+        task.cancel()
+        return aid
 
     def _fatal(self, e: BaseException) -> None:
         if self.fatal is None:  # sirf ek baar log (pehle har 30s par spam hota tha)
@@ -185,6 +197,13 @@ class Worker:
             log.error("Telegram session dead: %s: %s", type(e).__name__, e)
             log.error(SESSION_HELP)
         self.stop_event.set()
+
+    def _notify_job(self, aid: str | None) -> None:
+        if self.on_job:
+            try:
+                self.on_job(aid)
+            except Exception:  # noqa: BLE001 - UI hook kabhi pipeline na tode
+                pass
 
     def _check_stop(self) -> None:
         if self.stop_event.is_set():
@@ -265,6 +284,7 @@ class Worker:
 
     async def _run_job_with_heartbeat(self, job: dict) -> None:
         task = asyncio.create_task(self.process(job))
+        self._task = task
         hb = asyncio.create_task(self._heartbeat(task))
         try:
             await task
@@ -296,6 +316,7 @@ class Worker:
     async def process(self, job: dict) -> str:
         aid = job["archive_id"]
         self.current = aid
+        self._notify_job(aid)
         log.info("[%s] %s: process shuru (status %s)", aid, job["filename"], job["status"])
         try:
             await self._stage_extract(job)
@@ -338,6 +359,7 @@ class Worker:
             return "paused"
         finally:
             self.current = None
+            self._notify_job(None)
         self.repo.complete(aid)
         log.info("[%s] COMPLETED", aid)
         if self.cfg.cleanup:
