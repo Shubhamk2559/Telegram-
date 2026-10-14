@@ -29,8 +29,9 @@ ALIASES = {  # existing name <- spec name
     "TELEGRAPH_TITLE": "TELEGRAPH_ARTICLE_TITLE",
     "SESSION_STRING": "TELEGRAM_SESSION_STRING",
 }
-WORKER_DEFAULTS = {"UPLOAD_RESPONSE_TIMEOUT": "1800", "IMGBB_DELAY_SECONDS": "5", "IMGBB_RETRIES": "5",
-                   "TELEGRAPH_TITLE": "My Image Collection"}
+WORKER_DEFAULTS = {"UPLOAD_RESPONSE_TIMEOUT": "1800", "IMGBB_DELAY_SECONDS": "5", "IMGBB_RETRIES": "5"}
+# Telegraph title ka koi built-in naam nahi: TELEGRAPH_ARTICLE_TITLE (ya TELEGRAPH_TITLE) env me apna rakho.
+# Env khaali ho to "Gallery" use hota hai (Telegraph ko title chahiye hi).
 
 
 def apply_env_aliases(env=os.environ, defaults: dict | None = None) -> None:
