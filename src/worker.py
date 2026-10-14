@@ -37,7 +37,9 @@ from .strict_videos import StrictVideoUploader, VideoBlocked
 from .telegraph_publisher import METHOD_EMBED, TelegraphClient
 from .tg_publisher import PostPublisher, PublishBlocked
 from .upload_store import COMPLETED, collect_videos
-from .zip_processor import ArchiveCorrupted, ArchiveRejected, InsufficientSpace, Limits, extract_archive
+from .zip_processor import (
+    ArchiveCorrupted, ArchiveRejected, ExtractionResult, InsufficientSpace, Limits, extract_archive, sha256_file,
+)
 from .zip_telegraph import ST_FAILURES, ST_UNVERIFIED, ZipArticleError, publish_zip_article
 
 log = logging.getLogger("worker")
@@ -156,6 +158,7 @@ class Ports:
     make_uploader: Callable[[DbUploadStore], StrictVideoUploader]
     publisher: PostPublisher
     extract: Callable[[Path, Path, Limits], object] = extract_archive
+    download_media: Callable[[dict, Path], Awaitable[list]] | None = None  # seedhe bheje image/video batch ka download
     ensure_connected: Callable[[], Awaitable[None]] | None = None  # Telegram reconnect hook
 
 
@@ -420,30 +423,55 @@ class Worker:
                 log.warning("[%s] cleanup fail %s: %s", aid, rel, e)
 
     # ------------------------------------------------------------------ stages
+    @staticmethod
+    def _hash_media(raw: list[dict], dest: Path) -> list[dict]:
+        """Download hui media files -> extract_archive jaisi file dicts (sha256 file_id, size, relative_path)."""
+        out = []
+        for r in raw:
+            p = Path(r["path"])
+            size = p.stat().st_size
+            if size == 0:
+                log.warning("Khaali file skip: %s", p.name)
+                continue
+            out.append({"file_id": sha256_file(p), "type": r["type"], "filename": p.name, "size": size,
+                        "relative_path": p.resolve().relative_to(Path(dest).resolve()).as_posix(),
+                        "original_path_in_zip": f"msg:{r['msg_id']}/{p.name}"})
+        return out
+
     async def _stage_extract(self, job: dict) -> None:
         aid = job["archive_id"]
         fresh = self.repo.get(aid)  # latest
         info = fresh.get("extraction")
         if info is not None and (not self._media_needed(aid) or self._media_present(aid)):
             return  # kaam ho chuka ya media disk par maujood hai
-        self.repo.transition(aid, DOWNLOADING)
-        path = await self._retry(aid, "download", lambda: self._download(job))
-        self._check_stop()
-        self.repo.transition(aid, EXTRACTING)
         dest = self._job_dir(aid) / "extracted"
-        shutil.rmtree(dest, ignore_errors=True)  # adhoori purani extraction hatao
-        try:
-            res = await asyncio.to_thread(self.ports.extract, path, dest, self.cfg.limits)
-        except (ArchiveRejected, ArchiveCorrupted) as e:
-            raise StagePermanent(f"{type(e).__name__}: {e}") from e
-        except InsufficientSpace as e:
-            raise StagePause(f"Disk space kam: {e}") from e
+        self.repo.transition(aid, DOWNLOADING)
+        if (fresh.get("kind") or job.get("kind")) == "media":  # File Manager me seedhe bheje image(s)+video(s): ZIP nahi
+            if self.ports.download_media is None:
+                raise StagePermanent("Media batch download supported nahi hai (download_media port nahi).")
+            shutil.rmtree(dest, ignore_errors=True)
+            raw = await self._retry(aid, "download", lambda: self._download(job, lambda j: self.ports.download_media(j, dest)))
+            self._check_stop()
+            self.repo.transition(aid, EXTRACTING)
+            res = ExtractionResult(files=await asyncio.to_thread(self._hash_media, raw, dest))
+            path = None
+        else:
+            path = await self._retry(aid, "download", lambda: self._download(job))
+            self._check_stop()
+            self.repo.transition(aid, EXTRACTING)
+            shutil.rmtree(dest, ignore_errors=True)  # adhoori purani extraction hatao
+            try:
+                res = await asyncio.to_thread(self.ports.extract, path, dest, self.cfg.limits)
+            except (ArchiveRejected, ArchiveCorrupted) as e:
+                raise StagePermanent(f"{type(e).__name__}: {e}") from e
+            except InsufficientSpace as e:
+                raise StagePause(f"Disk space kam: {e}") from e
         if info is None:  # pehli baar: fixed naam do (DiskWala/ImgBB ko yahi naam jayega)
             n = rename_media(res.files, dest, self.cfg.video_name_base, self.cfg.image_name_base)
             log.info("[%s] Rename: %s file(s) rename hue (VIDEO_NAME_BASE=%r, IMAGE_NAME_BASE=%r)%s", aid, n,
                      self.cfg.video_name_base, self.cfg.image_name_base,
                      "" if (self.cfg.video_name_base or self.cfg.image_name_base) else " - base khaali hai, rename BAND hai")
-        else:  # redeploy ke baad re-extract: DB me jo naam/path saved hai wahi wapas rakho
+        else:  # redeploy ke baad dobara download/extract: DB me jo naam/path saved hai wahi wapas rakho
             ws, rdest = self.cfg.workspace.resolve(), dest.resolve()
             recorded = {}
             for rec in DbImageStore(self.db, aid).files + DbUploadStore(self.db, aid, self.cfg.bot_username, ws).files:
@@ -451,24 +479,25 @@ class Worker:
                 recorded[rec["file_id"]] = Path(os.path.relpath(p if p.is_absolute() else ws / p, rdest)).as_posix()
             restore_recorded_names(res.files, dest, recorded)
         files = [{**f, "path": f"{self._rel(dest)}/{f['relative_path']}"} for f in res.files]
+        arch = self._rel(path) if path else None  # media batch me ZIP file hoti hi nahi
         if info is None:
             if not any(f["type"] in ("image", "video") for f in files):
-                raise StagePermanent("ZIP me koi supported image/video nahi mila.")
+                raise StagePermanent("Is job me koi supported image/video nahi mila.")
             self._register_media(aid, job, files)
             self.repo.save_extraction(aid, {
-                "archive_path": self._rel(path), "dir": self._rel(dest),
+                "archive_path": arch, "dir": self._rel(dest),
                 "images": sum(f["type"] == "image" for f in files), "videos": sum(f["type"] == "video" for f in files),
                 "skipped": res.skipped_count})
-        else:  # redeploy ke baad re-extract: sizes DB se match hone chahiye
+        else:  # re-extract: sizes DB se match hone chahiye
             sizes = {f["file_id"]: f["size"] for f in files}
             for rec in DbImageStore(self.db, aid).files + DbUploadStore(self.db, aid, self.cfg.bot_username, self.cfg.workspace).files:
                 if rec["file_id"] in sizes and sizes[rec["file_id"]] != rec["size"]:
                     raise StagePermanent(f"Re-extract me {rec['filename']} ka size badal gaya.")
-            self.repo.save_extraction(aid, {**info, "archive_path": self._rel(path), "dir": self._rel(dest)})
+            self.repo.save_extraction(aid, {**info, "archive_path": arch, "dir": self._rel(dest)})
 
-    async def _download(self, job: dict) -> Path:
+    async def _download(self, job: dict, fn=None):
         try:
-            return await self.ports.download(job)
+            return await (fn or self.ports.download)(job)
         except ArchiveGone as e:
             raise StagePermanent(str(e)) from e
         except DownloadError as e:
