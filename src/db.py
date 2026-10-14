@@ -46,7 +46,8 @@ class Database:
             except ImportError as e:  # pragma: no cover
                 raise DBError("PostgreSQL ke liye 'psycopg[binary]' install karo (requirements.txt).") from e
             self._pg = psycopg
-            self._conn = psycopg.connect(self.url, autocommit=True, row_factory=dict_row, connect_timeout=15)
+            self._conn = psycopg.connect(self.url, autocommit=True, row_factory=dict_row, connect_timeout=15,
+                                        prepare_threshold=None)  # prepared statements band: ALTER TABLE ke baad 'cached plan' error nahi aata
         else:
             path = self.url[len("sqlite:///"):] if self.url.startswith("sqlite:///") else self.url
             if path != ":memory:":
@@ -68,7 +69,8 @@ class Database:
         return sql.replace("?", "%s") if self.kind == "postgres" else sql
 
     def _is_conn_error(self, e: Exception) -> bool:
-        return self.kind == "postgres" and isinstance(e, (self._pg.OperationalError, self._pg.InterfaceError))
+        return self.kind == "postgres" and isinstance(e, (self._pg.OperationalError, self._pg.InterfaceError,
+                                                             self._pg.errors.FeatureNotSupported))
 
     def _run(self, fn: Callable):
         """Connection toot jaye (idle timeout/redeploy) to ek baar reconnect - sirf transaction ke bahar."""
