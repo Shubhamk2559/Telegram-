@@ -53,7 +53,11 @@ class StrictVideoUploader(DiskWalaUploader):
         old = self.cfg.response_timeout
         self.cfg.response_timeout = timeout
         try:
-            return self._apply(rec, await self._wait_for_link(rec, sent_id))
+            out = await self._wait_for_link(rec, sent_id)
+            status = self._apply(rec, out)
+            if status == COMPLETED:
+                await self._cleanup(rec, sent_id, out)
+            return status
         finally:
             self.cfg.response_timeout = old
 
