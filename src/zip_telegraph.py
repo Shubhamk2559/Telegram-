@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from typing import Callable
@@ -45,8 +46,19 @@ def _plan(store: DbImageStore, method: str):
     return units, src_by_id, ids
 
 
+LAYOUT = "lead1"  # layout badla to fingerprint badalta hai: purana (image-pehle) article reuse nahi hota
+
+
+def _lead_node() -> dict:
+    """Har page ka PEHLA node image nahi hona chahiye: Telegraph pehli image ko title ke UPAR 'cover' bana deta hai.
+    Isliye pehle ek khaali line (ya TELEGRAPH_INTRO env ka text) rakhte hain: title sabse upar, phir saari images."""
+    intro = (os.getenv("TELEGRAPH_INTRO") or "").strip()
+    return {"tag": "p", "children": [intro] if intro else [{"tag": "br"}]}
+
+
 def _fingerprint(title: str, method: str, limit: int, ids: list[str], src_by_id: dict) -> str:
-    blob = json.dumps([title, method, limit, [[i, src_by_id[i]] for i in ids]], ensure_ascii=False)
+    blob = json.dumps([title, method, limit, LAYOUT, os.getenv("TELEGRAPH_INTRO") or "",
+                       [[i, src_by_id[i]] for i in ids]], ensure_ascii=False)
     return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
 
@@ -114,7 +126,7 @@ def publish_zip_article(*, articles: ArticleStore, store: DbImageStore, client: 
                 next_url = art["pages"][str(idx)]["url"]
                 continue
             chunk_ids = [u[1] for u in chunks[idx]]
-            nodes = [u[0] for u in chunks[idx]]
+            nodes = [_lead_node()] + [u[0] for u in chunks[idx]]
             if next_url:
                 nodes.append({"tag": "p", "children": [{"tag": "a", "attrs": {"href": next_url}, "children": ["Next page →"]}]})
             expected = [src_by_id[i] for i in chunk_ids]
