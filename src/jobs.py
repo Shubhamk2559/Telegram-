@@ -36,7 +36,7 @@ class Selection:
 def _decode(row: dict | None) -> dict | None:
     if row is None:
         return None
-    for k in ("progress", "extraction"):
+    for k in ("progress", "extraction", "media"):
         if row.get(k):
             row[k] = json.loads(row[k])
     return row
@@ -54,6 +54,21 @@ class JobRepo:
             "INSERT INTO archives (archive_id, chat_id, message_id, filename, size, msg_date, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (archive_id) DO NOTHING",
             (make_archive_id(chat_id, message_id), chat_id, message_id, filename, size, msg_date, DISCOVERED, now, now))
+        return n > 0
+
+    def discover_batch(self, chat_id: int, items: list[dict], msg_date: str | None = None) -> bool:
+        """File Manager me seedhe bheje image(s)+video(s) ka batch (ZIP nahi). archive_id = chat:pehla_message_id.
+        items = [{"id","kind":"image"|"video","name","size"}, ...] message order me. Pehle se ho to kuch nahi badalta."""
+        if not items:
+            return False
+        first = int(items[0]["id"])
+        ni, nv = sum(i["kind"] == "image" for i in items), sum(i["kind"] == "video" for i in items)
+        now = now_iso()
+        n = self.db.execute(
+            "INSERT INTO archives (archive_id, chat_id, message_id, filename, size, msg_date, status, kind, media, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (archive_id) DO NOTHING",
+            (make_archive_id(chat_id, first), chat_id, first, f"Media batch #{first} ({ni} img, {nv} vid)",
+             sum(int(i.get("size") or 0) for i in items), msg_date, DISCOVERED, "media", json.dumps(items), now, now))
         return n > 0
 
     def queue_discovered(self) -> int:
