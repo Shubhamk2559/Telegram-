@@ -94,7 +94,8 @@ class _Tracked:
 
 
 async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, lease: Lease | None = None, live=None):
-    from .channel_reader import ZipMessage, download_zip, resolve_channel
+    from .channel_reader import DownloadError, ZipMessage, download_zip, resolve_channel
+    from .zip_processor import MB, safe_name
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
     from .imgbb_uploader import ImgBBClient
@@ -123,13 +124,47 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         z = ZipMessage(job["message_id"], job["filename"], int(msg.file.size or job["size"] or 0), msg.date, msg)
         return await download_zip(_Tracked(client, live.on_download) if live else client, source, z, s)
 
+    async def download_media(job: dict, dest: Path) -> list[dict]:
+        """Batch (seedhe bheje image/video) ke messages dest/images|videos me download. ZIP ki tarah .part -> size check -> rename."""
+        import re
+        import shutil
+        specs = job.get("media") or []
+        msgs = await client.get_messages(source.entity, ids=[int(m["id"]) for m in specs])
+        got = [(m, sp) for m, sp in zip(msgs, specs) if m and getattr(m, "file", None)]
+        if not got:
+            raise ArchiveGone(f"Batch {job['archive_id']} ke saare messages channel me ab nahi hain.")
+        total = sum(int(m.file.size or sp.get("size") or 0) for m, sp in got)
+        dest.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(dest).free
+        if free < total + s.limits.min_free_bytes:
+            raise DownloadError(f"Disk space kam: {free // MB} MB free, chahiye ~{(total + s.limits.min_free_bytes) // MB} MB")
+        tracked = _Tracked(client, live.on_download) if live else client
+        out = []
+        for m, sp in got:
+            p = Path(sp["name"])
+            name = f"{m.id}_{safe_name(p.stem, 80)}{re.sub(r'[^A-Za-z0-9.]', '', p.suffix).lower()}"
+            folder = dest / ("images" if sp["kind"] == "image" else "videos")
+            folder.mkdir(parents=True, exist_ok=True)
+            final = folder / name
+            part = final.with_name(name + ".part")
+            await tracked.download_media(m, file=str(part))
+            if not part.exists():
+                raise DownloadError(f"Message {m.id} download nahi hua.")
+            want = int(m.file.size or 0)
+            if want and part.stat().st_size != want:
+                raise DownloadError(f"Message {m.id} adhoora download ({part.stat().st_size} / {want} bytes).")
+            part.replace(final)
+            out.append({"type": sp["kind"], "path": final, "name": name, "msg_id": m.id})
+        return out
+
     async def ensure_connected():
         if not client.is_connected():
             await client.connect()
 
     ports = Ports(
-        scan=lambda: scan_channel(client, source.entity, source.id, repo, backfill_from=cfg.backfill_from),
-        download=download,
+        scan=lambda: scan_channel(client, source.entity, source.id, repo, backfill_from=cfg.backfill_from,
+                                  media_batches=cfg.media_batches, quiet_seconds=cfg.media_quiet),
+        download=download, download_media=download_media,
         imgbb=ImgBBClient(s.imgbb_api_key, http, max_retries=s.imgbb_retries),
         telegraph=tg, http=http,
         make_uploader=lambda store: StrictVideoUploader(bot, store, cfg.uploader, policy=cfg.video_policy, ui=live),
@@ -254,7 +289,8 @@ async def cmd_scan(cfg: AppConfig, from_id: int | None) -> int:
     client = await connect_client(cfg)
     try:
         src = await resolve_channel(client, cfg.settings.channel_name, cfg.settings.channel_id)
-        info = await scan_channel(client, src.entity, src.id, repo, backfill_from=from_id or cfg.backfill_from)
+        info = await scan_channel(client, src.entity, src.id, repo, backfill_from=from_id or cfg.backfill_from,
+                                  media_batches=cfg.media_batches, quiet_seconds=cfg.media_quiet)
         print(f"Scan: {info}")
     finally:
         await client.disconnect()
