@@ -69,6 +69,8 @@ class AppConfig:
     session_string: str
     dest_id: int | None
     backfill_from: int | None
+    media_batches: bool
+    media_quiet: float
     link_preview: bool
     health_port: int
     health_enabled: bool
@@ -126,6 +128,8 @@ def load_app_config(env=os.environ, *, require_api: bool = True) -> AppConfig:
         session_string=(env.get("SESSION_STRING") or "").strip(),
         dest_id=int(dest_raw) if dest_raw else None,
         backfill_from=int(bf) if bf else None,
+        media_batches=_bool(env, "MEDIA_BATCHES_ENABLED", True),
+        media_quiet=_num(env, "MEDIA_BATCH_QUIET_SECONDS", 180.0, float),
         link_preview=_bool(env, "POST_LINK_PREVIEW", False),
         health_port=_num(env, "PORT", _num(env, "HEALTH_PORT", 8000)),
         health_enabled=_bool(env, "HEALTH_ENABLED", True),
