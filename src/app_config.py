@@ -110,6 +110,8 @@ def load_app_config(env=os.environ, *, require_api: bool = True) -> AppConfig:
             image_failure_policy=policy, telegraph_title=s.telegraph_title, telegraph_author=s.telegraph_author,
             telegraph_require_verified=_bool(env, "TELEGRAPH_REQUIRE_VERIFIED", False),
             template=template, images_only_template=images_only, videos_only_template=videos_only,
+            video_name_base=(env.get("VIDEO_NAME_BASE") or "").strip(),
+            image_name_base=(env.get("IMAGE_NAME_BASE") or "").strip(),
             max_links_per_post=max_links, cleanup=_bool(env, "CLEANUP_AFTER_COMPLETE", True),
             bot_username=s.diskwala_bot),
         video_policy=VideoPolicy(max_attempts=max(1, s.upload_retries), resend_on_timeout=_bool(env, "DISKWALA_RESEND_ON_TIMEOUT", True),
