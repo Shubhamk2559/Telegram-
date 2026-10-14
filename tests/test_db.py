@@ -11,7 +11,7 @@ class Migrations(unittest.TestCase):
 
     def test_migrate_creates_schema_and_is_repeatable(self):
         d = self.mem()
-        self.assertEqual(D.migrate(d), [1])
+        self.assertEqual(D.migrate(d), list(range(1, D.LATEST_VERSION + 1)))
         self.assertEqual(D.migrate(d), [])  # dobara: kuch nahi
         self.assertEqual(D.current_version(d), D.LATEST_VERSION)
         tables = {r["name"] for r in d.query("SELECT name FROM sqlite_master WHERE type='table'")}
