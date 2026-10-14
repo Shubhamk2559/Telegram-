@@ -26,6 +26,7 @@ PW_NAMES = ("TELEGRAM_2FA_PASSWORD", "TWO_FA_PASSWORD", "TG_2FA_PASSWORD", "TELE
 
 COMMANDS = [("login", "QR se Telegram login"), ("status", "Live progress card"), ("cancel", "Chal rahi task cancel"),
             ("queue", "Saari ZIP jobs"), ("resume", "PAUSED job wapas queue me"), ("requeue", "Cancelled/failed job wapas"),
+            ("dwstart", "DiskWala bot ko /start bhejo"), ("dwrestart", "DiskWala bot restart (stop+start)"),
             ("logout", "Telegram session hatao"), ("help", "Madad")]
 
 
@@ -148,7 +149,8 @@ class ControlBot:
             return
         fn = {"start": self.cmd_help, "help": self.cmd_help, "login": self.cmd_login, "logout": self.cmd_logout,
               "status": self.cmd_status, "cancel": self.cmd_cancel, "queue": self.cmd_queue,
-              "resume": self.cmd_resume, "requeue": self.cmd_requeue}.get(cmd)
+              "resume": self.cmd_resume, "requeue": self.cmd_requeue,
+              "dwstart": self.cmd_dwstart, "dwrestart": self.cmd_dwrestart}.get(cmd)
         if not fn:
             return await event.respond("Ye command nahi pata. /help dekho.")
         try:
@@ -173,7 +175,8 @@ class ControlBot:
             f"🤖 <b>ZIP Worker Control</b>\n{self._acct_line()}\n\n"
             "/login — QR se login (2FA password env se)\n/logout — session hatao\n/status — live progress card\n"
             "/cancel — chal rahi task cancel\n/queue — saari jobs\n/resume — PAUSED job chalao\n"
-            "/requeue — cancelled/failed job wapas" + warn, parse_mode="html")
+            "/requeue — cancelled/failed job wapas\n/dwstart — DiskWala bot ko /start\n"
+            "/dwrestart — DiskWala bot restart (stop → unblock → /start)" + warn, parse_mode="html")
 
     # ------------------------------------------------------------------ login / logout
     async def cmd_login(self, event) -> None:
@@ -396,6 +399,68 @@ class ControlBot:
         btns = self._buttons([[(f"♻️ {r['filename'][:30]}", f"requeue:{r['archive_id']}".encode())] for r in failed])
         await event.respond("Kaun si job wapas queue me daalni hai?", buttons=btns)
 
+    # ------------------------------------------------------------------ DiskWala bot start / restart
+    def _videos_busy(self) -> bool:
+        w = self.sup.worker
+        job = self.sup.repo.get(w.current) if (w and w.current) else None
+        return bool(job and job["status"] == "UPLOADING_VIDEOS")
+
+    async def _dw_ask(self, event, action: str) -> None:
+        from telethon import Button
+        if self.sup.client is None:
+            return await event.respond("Pehle /login karo (DiskWala bot tumhare Telegram account se chalta hai).")
+        busy = self._videos_busy()
+        if action == "start" and not busy:
+            return await self._dw_run(event.chat_id, "start")
+        what = ("🔁 <b>DiskWala bot restart?</b>\nBot ko stop (block) → unblock → /start kiya jayega. Bot ki purani state reset ho jati hai."
+                if action == "restart" else "▶️ <b>DiskWala bot ko /start bhejun?</b>")
+        if busy:
+            what += "\n\n⚠️ <b>Abhi videos upload ho rahe hain</b>: beech me karne se chal rahe video ka link miss ho sakta hai."
+        await event.respond(what, parse_mode="html",
+                            buttons=[[Button.inline("✅ Haan, karo", f"dw:{action}".encode()), Button.inline("↩️ Nahi", b"dw:no")]])
+
+    async def cmd_dwstart(self, event) -> None:
+        await self._dw_ask(event, "start")
+
+    async def cmd_dwrestart(self, event) -> None:
+        await self._dw_ask(event, "restart")
+
+    async def _dw_run(self, chat_id: int, action: str) -> None:
+        from .diskwala_uploader import excerpt, looks_manual
+        client = self.sup.client
+        if client is None:
+            return await self.bot.send_message(chat_id, "Pehle /login karo.")
+        name = self.cfg.uploader.bot_username
+        try:
+            ent = await client.get_entity(name)
+            if action == "restart":
+                from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
+                await client(BlockRequest(ent))
+                await asyncio.sleep(2)
+                await client(UnblockRequest(ent))
+                await asyncio.sleep(1)
+            sent = await client.send_message(ent, "/start")
+            reply = None
+            for _ in range(10):  # ~30s tak bot ka reply dekho
+                await asyncio.sleep(3)
+                msgs = await client.get_messages(ent, limit=10, min_id=sent.id)
+                got = [m for m in reversed(msgs) if not m.out]
+                if got:
+                    reply = got[0]
+                    break
+            head = "🔁 <b>DiskWala bot restart ho gaya</b>" if action == "restart" else "▶️ <b>/start bhej diya</b>"
+            if reply is None:
+                body = "Bot ne 30s me reply nahi diya. Telegram me @" + esc(name) + " ka chat check karo."
+            else:
+                body = f"💬 Bot ka reply:\n<i>{esc(excerpt(reply.raw_text or '', 300) or '(bina text ka)')}</i>"
+                if looks_manual(reply.raw_text or ""):
+                    body += "\n\n⚠️ Bot ko <b>manual step</b> chahiye (join/verify/captcha): Telegram me bot ke chat me complete karo."
+            await self.bot.send_message(chat_id, f"{head}\n{body}", parse_mode="html")
+        except Exception as e:  # noqa: BLE001
+            log.warning("DiskWala %s fail: %s", action, type(e).__name__)
+            await self.bot.send_message(chat_id, f"❌ DiskWala {action} fail: <code>{esc(type(e).__name__)}: {esc(str(e)[:160])}</code>",
+                                        parse_mode="html")
+
     # ------------------------------------------------------------------ buttons
     async def _on_callback(self, event) -> None:
         from telethon.errors import MessageNotModifiedError
@@ -442,6 +507,13 @@ class ControlBot:
             await event.answer()
         elif data == "logout_no":
             await edit("Theek hai, logout nahi kiya.")
+            await event.answer()
+        elif data in ("dw:start", "dw:restart"):
+            await edit("⏳ DiskWala bot par kaam ho raha hai…")
+            await event.answer()
+            await self._dw_run(chat_id, data[3:])
+        elif data == "dw:no":
+            await edit("Theek hai, kuch nahi kiya.")
             await event.answer()
         elif data == "login_cancel":
             if self._login_task and not self._login_task.done():
