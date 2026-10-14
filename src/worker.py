@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import re
 import shutil
@@ -31,6 +32,7 @@ from .posts import (
     plan_posts, sort_videos,
 )
 from .publish import upload_images
+from .renamer import rename_media, restore_recorded_names
 from .strict_videos import StrictVideoUploader, VideoBlocked
 from .telegraph_publisher import METHOD_EMBED, TelegraphClient
 from .tg_publisher import PostPublisher, PublishBlocked
@@ -130,6 +132,8 @@ class WorkerConfig:
     image_failure_policy: str = "pause"   # pause | skip
     telegraph_title: str = "Gallery"
     telegraph_author: str = ""
+    video_name_base: str = ""   # e.g. "Trader Master": videos -> "Trader Master 01.mp4" (bada size = 01). Khaali = rename nahi
+    image_name_base: str = ""   # images -> "<base> 01.jpg", ... Khaali = rename nahi
     telegraph_method: str = METHOD_EMBED
     telegraph_require_verified: bool = False
     template: str = DEFAULT_TEMPLATE
@@ -434,6 +438,18 @@ class Worker:
             raise StagePermanent(f"{type(e).__name__}: {e}") from e
         except InsufficientSpace as e:
             raise StagePause(f"Disk space kam: {e}") from e
+        if info is None:  # pehli baar: fixed naam do (DiskWala/ImgBB ko yahi naam jayega)
+            n = rename_media(res.files, dest, self.cfg.video_name_base, self.cfg.image_name_base)
+            log.info("[%s] Rename: %s file(s) rename hue (VIDEO_NAME_BASE=%r, IMAGE_NAME_BASE=%r)%s", aid, n,
+                     self.cfg.video_name_base, self.cfg.image_name_base,
+                     "" if (self.cfg.video_name_base or self.cfg.image_name_base) else " - base khaali hai, rename BAND hai")
+        else:  # redeploy ke baad re-extract: DB me jo naam/path saved hai wahi wapas rakho
+            ws, rdest = self.cfg.workspace.resolve(), dest.resolve()
+            recorded = {}
+            for rec in DbImageStore(self.db, aid).files + DbUploadStore(self.db, aid, self.cfg.bot_username, ws).files:
+                p = Path(rec["path"])
+                recorded[rec["file_id"]] = Path(os.path.relpath(p if p.is_absolute() else ws / p, rdest)).as_posix()
+            restore_recorded_names(res.files, dest, recorded)
         files = [{**f, "path": f"{self._rel(dest)}/{f['relative_path']}"} for f in res.files]
         if info is None:
             if not any(f["type"] in ("image", "video") for f in files):
