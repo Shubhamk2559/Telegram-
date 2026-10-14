@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
 import logging
 from typing import Awaitable, Callable
 
@@ -211,7 +212,7 @@ class Supervisor:
                             break
                         continue
                     log.exception("Worker setup fail")
-                    await self._notify(f"❌ <b>Setup error:</b> <code>{type(e).__name__}: {str(e)[:300]}</code>\n60s baad dobara try karunga.")
+                    await self._notify(f"❌ <b>Setup error:</b> <code>{html.escape(type(e).__name__ + ': ' + str(e)[:300], quote=False)}</code>\n60s baad dobara try karunga.")
                     await self._sleep(60)
                     continue
                 worker.on_job = self.live.reset
