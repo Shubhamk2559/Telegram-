@@ -46,8 +46,10 @@ def upload_images(store: ImageStore, client: ImgBBClient, work: list[dict], work
     for i, rec in enumerate(work, 1):
         label = f"[{i}/{len(work)}] {rec['filename']}"
         store.update(rec, "imgbb", attempts=rec["imgbb"]["attempts"] + 1)
+        local_path = None
         try:
-            res = client.upload(resolve_media_path(workspace, rec["path"]), rec["filename"])
+            local_path = resolve_media_path(workspace, rec["path"])
+            res = client.upload(local_path, rec["filename"])
         except ImgBBFatal as e:
             run.stopped_reason = str(e)
             out(f"{label}: ROKA GAYA - {e}")
@@ -63,7 +65,15 @@ def upload_images(store: ImageStore, client: ImgBBClient, work: list[dict], work
                          delete_url=res["delete_url"], uploaded_at=utc_now())
             store.update(rec, "html_embed", constructed=res["html_embeds"])
             run.uploaded += 1
-            out(f"{label}: OK")
+            note = ""
+            try:  # compress-check: ImgBB ne jo size bataya wo hamari original file se match hona chahiye
+                local, remote = local_path.stat().st_size, int(res.get("size") or 0)
+                store.update(rec, "imgbb", size_local=local, size_remote=remote)
+                if remote and remote != local:
+                    note = f" [WARNING: ImgBB size {remote} B != original {local} B - ImgBB ne file badli/compress ki ho sakti hai]"
+            except (OSError, ValueError, TypeError):
+                pass
+            out(f"{label}: OK{note}")
         if i < len(work) and delay:
             sleep(delay)
     return run
