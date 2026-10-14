@@ -128,7 +128,7 @@ class WorkerConfig:
     imgbb_delay: float = 5.0
     image_chunk: int = 5                  # itni images ke baad stop-check
     image_failure_policy: str = "pause"   # pause | skip
-    telegraph_title: str = "My Image Collection"
+    telegraph_title: str = "Gallery"
     telegraph_author: str = ""
     telegraph_method: str = METHOD_EMBED
     telegraph_require_verified: bool = False
