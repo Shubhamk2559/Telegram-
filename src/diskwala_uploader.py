@@ -10,6 +10,7 @@ Design notes (Hinglish):
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import sys
 import time
@@ -21,6 +22,8 @@ from urllib.parse import urlparse
 from .manifest import utc_now
 from .upload_store import AWAITING, COMPLETED, FAILED, INTERRUPTED, UPLOADING, UploadStore
 from .zip_processor import MB
+
+log = logging.getLogger("diskwala")
 
 # ----------------------------------------------------------------------------- parsing
 
@@ -140,6 +143,7 @@ class BotChannel(Protocol):
     async def send_video(self, path: Path, progress: Callable[[int, int], None]) -> int: ...
     async def fetch_replies(self, after_id: int) -> list[BotReply]: ...
     async def find_recent_outgoing(self, after_id: int, size: int) -> int | None: ...
+    async def delete_messages(self, ids: list[int]) -> None: ...
 
 
 def reply_from_message(m) -> BotReply:
@@ -189,6 +193,9 @@ class TelethonBotChannel:
     async def fetch_replies(self, after_id: int) -> list[BotReply]:
         msgs = await self.client.get_messages(self.entity, limit=30, min_id=after_id)
         return [reply_from_message(m) for m in msgs if not m.out]
+
+    async def delete_messages(self, ids: list[int]) -> None:
+        await self.client.delete_messages(self.entity, list(ids), revoke=True)
 
     async def find_recent_outgoing(self, after_id: int, size: int) -> int | None:
         msgs = await self.client.get_messages(self.entity, limit=10, min_id=after_id)
@@ -264,6 +271,7 @@ class UploaderConfig:
     delay_between: float = 3.0
     max_flood_wait: int = 900
     max_flood_retries: int = 5
+    delete_after_link: bool = True  # link DB me save hone ke baad bot chat se video + link wale messages hata do
 
 
 @dataclass
@@ -371,7 +379,10 @@ class DiskWalaUploader:
             st.update(rec, status=AWAITING, sent_message_id=sent_id)
             self.ui.status("Upload ho gaya. Bot ke reply ka intezaar...")
             out = await self._wait_for_link(rec, sent_id)
-            return self._apply(rec, out)
+            status = self._apply(rec, out)
+            if status == COMPLETED:
+                await self._cleanup(rec, sent_id, out)
+            return status
         except asyncio.CancelledError:
             st.update(rec, status=INTERRUPTED, finished_at=utc_now(),
                       error="Beech me roka gaya (Ctrl+C). Bot ko file mili ho sakti hai - chat check karo.")
@@ -479,6 +490,29 @@ class DiskWalaUploader:
                 f"Aakhri reply: '{last_texts[-1]}'"
                 + (f" (DISKWALA_LINK_DOMAINS filter on hai: {', '.join(cfg.link_domains)})" if cfg.link_domains else "")))
         return Outcome("timeout", error=f"Timeout: {int(cfg.response_timeout)}s me bot ne koi reply nahi diya.")
+
+    async def _cleanup(self, rec: dict, sent_id: int, out: Outcome) -> None:
+        """Link DB me save ho chuka hai (_apply). Ab bot chat se hamara video + bot ke is video ke reply (link) hata do.
+        Kabhi job ko fail nahi karta. Jis link ka match shaky hai (needs_review) uske messages chhod deta hai."""
+        if not self.cfg.delete_after_link or out.kind != "link":
+            return
+        if rec.get("needs_review"):
+            self.ui.status("Link ka match pakka nahi (review): chat ke messages delete nahi kiye.")
+            return
+        delete = getattr(self.channel, "delete_messages", None)
+        if delete is None:
+            return
+        try:
+            ids = {sent_id}
+            if out.reply_id:
+                ids.add(out.reply_id)
+            for r in await self.channel.fetch_replies(sent_id):
+                if r.id > sent_id and r.reply_to_id == sent_id:  # sirf isi video ke replies (progress/link)
+                    ids.add(r.id)
+            await delete(sorted(ids))
+            log.info("[%s] Bot chat se %d message(s) delete (video + link reply).", rec.get("filename"), len(ids))
+        except Exception as e:  # noqa: BLE001 - cleanup fail hone se link nahi jaata
+            log.warning("[%s] Chat cleanup fail (%s: %s): link safe hai.", rec.get("filename"), type(e).__name__, e)
 
     def _link(self, rec: dict, r: BotReply, urls: list, sent_id: int, match: str | None = None) -> Outcome:
         if match is None:
