@@ -208,6 +208,10 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (2, "posts_sending_started_at", [
         "ALTER TABLE posts ADD COLUMN sending_started_at TEXT",
     ]),
+    (3, "archives_kind_media", [  # kind: NULL/'zip' = ZIP file, 'media' = seedhe bheje image/video ka batch
+        "ALTER TABLE archives ADD COLUMN kind TEXT",
+        "ALTER TABLE archives ADD COLUMN media TEXT",
+    ]),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 
