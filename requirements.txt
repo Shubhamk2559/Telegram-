@@ -1,4 +1,6 @@
 telethon>=1.36
+# Telegram download/upload speed: bina cryptg ke Telethon pure-Python AES use karta hai (CPU par atka, 5-10x slow)
+cryptg>=0.4
 python-dotenv>=1.0
 qrcode>=7.4
 # Production database (PostgreSQL). SQLite local/dev ke liye built-in hai.
