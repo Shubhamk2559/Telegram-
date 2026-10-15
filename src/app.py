@@ -98,6 +98,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     from .zip_processor import MB, safe_name
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
+    from .upload_bots import LazyBotChannel, active_key
     from .imgbb_uploader import ImgBBClient
     from .scanner import scan_channel
     from .strict_videos import StrictVideoUploader
@@ -112,7 +113,25 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         raise ConfigError("FINAL_POST_DESTINATION_ID set nahi hai.")
     source = await resolve_channel(client, s.channel_name, s.channel_id)
     dest = await resolve_channel(client, "", cfg.dest_id)
-    bot = await TelethonBotChannel.connect(client, s.diskwala_bot, s.upload_as_document)
+    # Active bot (DB me /switchbot se badla hua, warna env default) ko pehle hi connect karo: galat username startup par pakda jaye.
+    # Dusre bot lazy hain: switch ke baad pehli use par connect hote hain.
+    bots = cfg.bots or {}
+    channels: dict = {}
+    first = active_key(repo, bots, cfg.default_bot) if bots else ""
+    for key, prof in bots.items():
+        if key == first:
+            channels[key] = await TelethonBotChannel.connect(client, prof.username, s.upload_as_document)
+        else:
+            channels[key] = LazyBotChannel(client, prof.username, s.upload_as_document)
+    legacy_bot = None if bots else await TelethonBotChannel.connect(client, s.diskwala_bot, s.upload_as_document)
+
+    def make_uploader(store):
+        if not bots:  # purane tests/configs (bots={}) ke liye pehle jaisa
+            return StrictVideoUploader(legacy_bot, store, cfg.uploader, policy=cfg.video_policy, ui=live)
+        key = active_key(repo, bots, cfg.default_bot)  # har ZIP ke video stage par DB se padhta hai => /switchbot turant lagta hai
+        prof = bots[key]
+        log.info("Video upload bot: %s (@%s)", prof.label, prof.username)
+        return StrictVideoUploader(channels[key], store, prof.uploader, policy=prof.policy, ui=live)
     http = UrllibHttp()
     tg = TelegraphClient(http)
     ensure_token_db(tg, s.telegraph_token, repo, s.telegraph_author)
@@ -167,7 +186,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         download=download, download_media=download_media,
         imgbb=ImgBBClient(s.imgbb_api_key, http, max_retries=s.imgbb_retries),
         telegraph=tg, http=http,
-        make_uploader=lambda store: StrictVideoUploader(bot, store, cfg.uploader, policy=cfg.video_policy, ui=live),
+        make_uploader=make_uploader,
         publisher=PostPublisher(TelethonDestination(client, dest.entity, cfg.link_preview), PostStore(db), cfg.publish_policy),
         ensure_connected=ensure_connected)
     return Worker(db, repo, cfg.worker, ports, lease=lease)
