@@ -75,8 +75,16 @@ class StrictVideoUploader(DiskWalaUploader):
                 await self.sleep(self.cfg.delay_between)
         return sum(r["status"] == COMPLETED for r in ordered)
 
+    def _reset_if_other_bot(self, rec: dict) -> None:
+        """Bot switch hua: pichle bot ke sent_message_id ka naye bot ki chat me koi matlab nahi. Fresh send karo."""
+        owner = rec.get("bot")
+        if owner and owner.lower() != self.cfg.bot_username.lower() and rec["status"] != COMPLETED:
+            self.store.update(rec, status=PENDING, sent_message_id=None, pre_send_latest_id=None, error=None,
+                              reply_message_id=None, bot=None)
+
     async def _drive(self, rec: dict) -> None:
         name = rec["filename"]
+        self._reset_if_other_bot(rec)
         if rec["status"] in (AWAITING, INTERRUPTED, UPLOADING, FAILED):
             if await self._recover(rec):
                 return
