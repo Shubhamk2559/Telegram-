@@ -99,6 +99,11 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
     from .upload_bots import LazyBotChannel, active_key
+    import importlib.util
+    if importlib.util.find_spec("cryptg") is None:
+        log.warning("cryptg install nahi hai: Telegram download/upload bohot slow rahega (pip install cryptg).")
+    else:
+        log.info("cryptg ON: fast Telegram encryption.")
     from .imgbb_uploader import ImgBBClient
     from .scanner import scan_channel
     from .strict_videos import StrictVideoUploader
