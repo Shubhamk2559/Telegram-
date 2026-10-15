@@ -175,7 +175,7 @@ class Worker:
         self.sleep, self.rng = sleep, rng
         self.articles, self.posts = ArticleStore(db), PostStore(db)
         self.stop_event = asyncio.Event()
-        self._prepared = False
+        self._prepared: set[str] = set()  # kin bots par prepare() (/start check) ho chuka
         self.current: str | None = None
         self._crashes: dict[str, int] = {}
         self._job_cancelled = False
@@ -603,9 +603,10 @@ class Worker:
         log.info("[%s] %s video(s), bada pehle: %s", aid, len(order),
                  ", ".join(f"{v['filename']} ({v['size'] / 1048576:.0f} MB)" for v in order[:10]) + (" ..." if len(order) > 10 else ""))
         uploader = self.ports.make_uploader(store)
-        if not self._prepared:
+        bot_key = (getattr(getattr(uploader, "cfg", None), "bot_username", "") or "").lower()
+        if bot_key not in self._prepared:
             await uploader.prepare()
-            self._prepared = True
+            self._prepared.add(bot_key)
         total = len(store.files)
         try:
             await uploader.process_all(store.files)
