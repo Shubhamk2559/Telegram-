@@ -3,7 +3,7 @@ naam (TELEGRAM_API_ID, FILE_MANAGER_CHANNEL_ID...) unke aliases hain. Dono set h
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import ConfigError, Settings, load_settings
@@ -14,6 +14,7 @@ from .posts import (
 )
 from .strict_videos import VideoPolicy
 from .tg_publisher import PublishPolicy
+from .upload_bots import BotProfile, build_profiles
 from .worker import WorkerConfig
 from .zip_processor import MB
 
@@ -75,6 +76,8 @@ class AppConfig:
     health_port: int
     health_enabled: bool
     log_level: str
+    bots: dict = field(default_factory=dict)   # {"diskwala": BotProfile, "flezen": BotProfile}
+    default_bot: str = "diskwala"              # DB me koi choice save na ho tab ye (env UPLOAD_BOT_DEFAULT)
 
     def __repr__(self) -> str:  # secrets (api_hash, session, DB password, keys) kabhi repr/log me na jayein
         return "AppConfig(<redacted>)"
@@ -104,6 +107,14 @@ def load_app_config(env=os.environ, *, require_api: bool = True) -> AppConfig:
     dest_raw = (env.get("FINAL_POST_DESTINATION_ID") or "").strip()
     bf = (env.get("SCAN_BACKFILL_FROM_MESSAGE_ID") or "").strip()
     default_db = f"sqlite:///{ws / 'app.db'}"
+    video_policy = VideoPolicy(max_attempts=max(1, s.upload_retries), resend_on_timeout=_bool(env, "DISKWALA_RESEND_ON_TIMEOUT", True),
+                               late_reply_grace=_num(env, "DISKWALA_LATE_REPLY_GRACE_SECONDS", 300.0, float))
+    uploader = UploaderConfig(bot_username=s.diskwala_bot, response_timeout=float(s.upload_timeout),
+                              poll_interval=s.upload_poll, max_retries=s.upload_retries,
+                              max_upload_bytes=(s.max_upload_mb or 2000) * MB, link_domains=s.link_domains,
+                              delay_between=s.upload_delay, max_flood_wait=s.max_flood_wait,
+                              delete_after_link=_bool(env, "DISKWALA_DELETE_AFTER_LINK", True))
+    bots, default_bot = build_profiles(env, uploader, video_policy)
     return AppConfig(
         settings=s,
         worker=WorkerConfig(
@@ -116,13 +127,7 @@ def load_app_config(env=os.environ, *, require_api: bool = True) -> AppConfig:
             image_name_base=(env.get("IMAGE_NAME_BASE") or "").strip(),
             max_links_per_post=max_links, cleanup=_bool(env, "CLEANUP_AFTER_COMPLETE", True),
             bot_username=s.diskwala_bot),
-        video_policy=VideoPolicy(max_attempts=max(1, s.upload_retries), resend_on_timeout=_bool(env, "DISKWALA_RESEND_ON_TIMEOUT", True),
-                                 late_reply_grace=_num(env, "DISKWALA_LATE_REPLY_GRACE_SECONDS", 300.0, float)),
-        uploader=UploaderConfig(bot_username=s.diskwala_bot, response_timeout=float(s.upload_timeout),
-                                poll_interval=s.upload_poll, max_retries=s.upload_retries,
-                                max_upload_bytes=(s.max_upload_mb or 2000) * MB, link_domains=s.link_domains,
-                                delay_between=s.upload_delay, max_flood_wait=s.max_flood_wait,
-                                delete_after_link=_bool(env, "DISKWALA_DELETE_AFTER_LINK", True)),
+        video_policy=video_policy, uploader=uploader,
         publish_policy=PublishPolicy(max_flood_wait=s.max_flood_wait),
         database_url=(env.get("DATABASE_URL") or "").strip() or default_db,
         session_string=(env.get("SESSION_STRING") or "").strip(),
@@ -133,4 +138,5 @@ def load_app_config(env=os.environ, *, require_api: bool = True) -> AppConfig:
         link_preview=_bool(env, "POST_LINK_PREVIEW", False),
         health_port=_num(env, "PORT", _num(env, "HEALTH_PORT", 8000)),
         health_enabled=_bool(env, "HEALTH_ENABLED", True),
-        log_level=(env.get("LOG_LEVEL") or "INFO").strip().upper())
+        log_level=(env.get("LOG_LEVEL") or "INFO").strip().upper(),
+        bots=bots, default_bot=default_bot)
