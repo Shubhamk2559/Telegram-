@@ -80,6 +80,14 @@ class Upload(unittest.TestCase):
             client(http).upload(self.f)
         self.assertEqual(len(http.calls), 4)
 
+    def test_http_400_rate_limit_reached_is_fatal_wait_not_per_image_failure(self):
+        # asli logs: ImgBB ne "HTTP 400: Rate limit reached." diya, 31 images ek-ek karke fail hui thi
+        http = FakeHttp(); http.queue("POST", ib.IMGBB_ENDPOINT, [jresp({"error": {"message": "Rate limit reached."}}, 400)] * 4)
+        with self.assertRaises(ib.ImgBBFatal) as cm:
+            client(http).upload(self.f)
+        self.assertIn("rate limit", str(cm.exception).lower())  # worker isi text se "wait karo" decide karta hai
+        self.assertEqual(len(http.calls), 4)
+
     def test_key_never_leaks_into_errors(self):
         http = FakeHttp(); http.queue("POST", ib.IMGBB_ENDPOINT, [NetworkError("failed https://x?key=SECRETKEY")] * 4)
         with self.assertRaises(ib.ImgBBError) as cm:
