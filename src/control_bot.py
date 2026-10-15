@@ -27,7 +27,8 @@ PW_NAMES = ("TELEGRAM_2FA_PASSWORD", "TWO_FA_PASSWORD", "TG_2FA_PASSWORD", "TELE
 COMMANDS = [("login", "🔐 Log in to Telegram via QR"), ("status", "📊 Live progress card"), ("cancel", "⛔ Cancel the running task"),
             ("queue", "📋 All ZIP jobs"), ("resume", "▶️ Put a PAUSED job back in the queue"),
             ("requeue", "♻️ Re-queue a cancelled/failed job"),
-            ("dwstart", "🚀 Send /start to the DiskWala bot"), ("dwrestart", "🔁 Restart the DiskWala bot (stop + start)"),
+            ("switchbot", "🔀 Switch the video upload bot (DiskWala / Flezen)"),
+            ("dwstart", "🚀 Send /start to the active upload bot"), ("dwrestart", "🔁 Restart the active upload bot (stop + start)"),
             ("logout", "🚪 Remove the Telegram session"), ("help", "❓ Help")]
 
 
@@ -151,7 +152,7 @@ class ControlBot:
         fn = {"start": self.cmd_help, "help": self.cmd_help, "login": self.cmd_login, "logout": self.cmd_logout,
               "status": self.cmd_status, "cancel": self.cmd_cancel, "queue": self.cmd_queue,
               "resume": self.cmd_resume, "requeue": self.cmd_requeue,
-              "dwstart": self.cmd_dwstart, "dwrestart": self.cmd_dwrestart}.get(cmd)
+              "switchbot": self.cmd_switchbot, "dwstart": self.cmd_dwstart, "dwrestart": self.cmd_dwrestart}.get(cmd)
         if not fn:
             return await event.respond("🤔 Unknown command. Send /help to see what I can do.")
         try:
@@ -183,9 +184,10 @@ class ControlBot:
             "/cancel — ⛔ cancel the running task\n"
             "/resume — ▶️ resume a PAUSED job\n"
             "/requeue — ♻️ re-queue a cancelled/failed job\n\n"
-            "💿 <b>DiskWala bot</b>\n"
-            "/dwstart — 🚀 send /start to the bot\n"
-            "/dwrestart — 🔁 restart (stop → unblock → /start)" + warn, parse_mode="html")
+            "💿 <b>Upload bot</b>\n"
+            "/switchbot — 🔀 choose DiskWala or Flezen for video uploads\n"
+            "/dwstart — 🚀 send /start to the active bot\n"
+            "/dwrestart — 🔁 restart the active bot (stop → unblock → /start)" + warn, parse_mode="html")
 
     # ------------------------------------------------------------------ login / logout
     async def cmd_login(self, event) -> None:
@@ -411,6 +413,58 @@ class ControlBot:
         btns = self._buttons([[(f"♻️ {r['filename'][:30]}", f"requeue:{r['archive_id']}".encode())] for r in failed])
         await event.respond("♻️ <b>Which job should go back in the queue?</b>", buttons=btns, parse_mode="html")
 
+    # ------------------------------------------------------------------ upload bot switch (DiskWala / Flezen)
+    def _active_profile(self):
+        from .upload_bots import active_key
+        bots = self.cfg.bots
+        if not bots:
+            return None
+        return bots[active_key(self.sup.repo, bots, self.cfg.default_bot)]
+
+    def _active_bot_name(self) -> tuple[str, str]:
+        """(label, username) of the bot videos go to right now."""
+        prof = self._active_profile()
+        return (prof.label, prof.username) if prof else ("DiskWala", self.cfg.uploader.bot_username)
+
+    async def cmd_switchbot(self, event) -> None:
+        from telethon import Button
+        if not self.cfg.bots:
+            return await event.respond("❌ No upload bots are configured.")
+        cur = self._active_profile()
+        rows = [[Button.inline(("✅ " if p.key == cur.key else "") + f"{p.label} (@{p.username})", f"ub:{p.key}".encode())]
+                for p in self.cfg.bots.values()]
+        text = (f"🔀 <b>Video upload bot</b>\n{DIV}\nActive now: <b>{esc(cur.label)}</b> (@{esc(cur.username)})\n\n"
+                "Pick the bot that should receive the videos. It applies from the <b>next ZIP's video step</b> "
+                "(or when a PAUSED ZIP is resumed). A ZIP whose videos are uploading right now finishes on the current bot.")
+        if self._videos_busy():
+            text += "\n\n⚠️ Videos are uploading right now."
+        await event.respond(text, parse_mode="html", buttons=rows)
+
+    async def _switch_to(self, key: str) -> str:
+        """Validate the bot exists on Telegram (if logged in), then save the choice. Returns an HTML message."""
+        from .upload_bots import set_active
+        prof = self.cfg.bots.get(key)
+        if prof is None:
+            return "❌ Unknown bot."
+        if self.sup.client is not None:
+            from .diskwala_uploader import TelethonBotChannel, UploaderError
+            try:
+                await TelethonBotChannel.connect(self.sup.client, prof.username, self.cfg.settings.upload_as_document)
+            except UploaderError as e:
+                return f"❌ Not switched: {esc(str(e)[:200])}"
+            except Exception as e:  # noqa: BLE001
+                return f"❌ Not switched: <code>{esc(type(e).__name__)}: {esc(str(e)[:160])}</code>"
+        set_active(self.sup.repo, self.cfg.bots, key)
+        note = "\n\n▶️ If a ZIP is PAUSED on the old bot, send /resume to continue it on the new one." if self._paused_any() else ""
+        return (f"✅ <b>Video upload bot: {esc(prof.label)}</b> (@{esc(prof.username)})\n"
+                "It applies from the next ZIP's video step." + note)
+
+    def _paused_any(self) -> bool:
+        try:
+            return any(r["status"] == PAUSED for r in self.sup.repo.list())
+        except Exception:  # noqa: BLE001
+            return False
+
     # ------------------------------------------------------------------ DiskWala bot start / restart
     def _videos_busy(self) -> bool:
         w = self.sup.worker
@@ -420,12 +474,13 @@ class ControlBot:
     async def _dw_ask(self, event, action: str) -> None:
         from telethon import Button
         if self.sup.client is None:
-            return await event.respond("🔐 Please /login first (the DiskWala bot is driven from your Telegram account).")
+            return await event.respond("🔐 Please /login first (the upload bot is driven from your Telegram account).")
         busy = self._videos_busy()
         if action == "start" and not busy:
             return await self._dw_run(event.chat_id, "start")
-        what = (f"🔁 <b>Restart the DiskWala bot?</b>\n{DIV}\nThe bot will be stopped (blocked) → unblocked → sent /start. Its old state is reset."
-                if action == "restart" else "🚀 <b>Send /start to the DiskWala bot?</b>")
+        label = self._active_bot_name()[0]
+        what = (f"🔁 <b>Restart the {esc(label)} bot?</b>\n{DIV}\nThe bot will be stopped (blocked) → unblocked → sent /start. Its old state is reset."
+                if action == "restart" else f"🚀 <b>Send /start to the {esc(label)} bot?</b>")
         if busy:
             what += "\n\n⚠️ <b>Videos are uploading right now.</b> Doing this mid-upload may lose the link of the video in progress."
         await event.respond(what, parse_mode="html",
@@ -442,7 +497,7 @@ class ControlBot:
         client = self.sup.client
         if client is None:
             return await self.bot.send_message(chat_id, "🔐 Please /login first.")
-        name = self.cfg.uploader.bot_username
+        label, name = self._active_bot_name()
         try:
             ent = await client.get_entity(name)
             if action == "restart":
@@ -460,7 +515,7 @@ class ControlBot:
                 if got:
                     reply = got[0]
                     break
-            head = "🔁 <b>DiskWala bot restarted</b>" if action == "restart" else "🚀 <b>/start sent</b>"
+            head = f"🔁 <b>{esc(label)} bot restarted</b>" if action == "restart" else f"🚀 <b>/start sent to {esc(label)}</b>"
             if reply is None:
                 body = "⌛ The bot did not reply within 30s. Check your chat with @" + esc(name) + " in Telegram."
             else:
@@ -469,8 +524,8 @@ class ControlBot:
                     body += "\n\n⚠️ The bot needs a <b>manual step</b> (join / verify / captcha). Complete it in the bot's chat in Telegram."
             await self.bot.send_message(chat_id, f"{head}\n{body}", parse_mode="html")
         except Exception as e:  # noqa: BLE001
-            log.warning("DiskWala %s failed: %s", action, type(e).__name__)
-            await self.bot.send_message(chat_id, f"❌ DiskWala {action} failed: <code>{esc(type(e).__name__)}: {esc(str(e)[:160])}</code>",
+            log.warning("%s %s failed: %s", label, action, type(e).__name__)
+            await self.bot.send_message(chat_id, f"❌ {esc(label)} {action} failed: <code>{esc(type(e).__name__)}: {esc(str(e)[:160])}</code>",
                                         parse_mode="html")
 
     # ------------------------------------------------------------------ buttons
@@ -521,9 +576,13 @@ class ControlBot:
             await edit("👍 Okay, you are still logged in.")
             await event.answer()
         elif data in ("dw:start", "dw:restart"):
-            await edit("⏳ Working on the DiskWala bot…")
+            await edit("⏳ Working on the upload bot…")
             await event.answer()
             await self._dw_run(chat_id, data[3:])
+        elif data.startswith("ub:"):
+            await event.answer()
+            await edit("⏳ Switching…")
+            await edit(await self._switch_to(data[3:]))
         elif data == "dw:no":
             await edit("👍 Okay, nothing was changed.")
             await event.answer()
