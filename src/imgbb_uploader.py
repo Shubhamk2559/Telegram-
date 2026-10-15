@@ -115,6 +115,7 @@ class ImgBBClient:
         url = f"{IMGBB_ENDPOINT}?key={self._key}"
 
         last = "unknown error"
+        rate_limited = False
         for attempt in range(self.max_retries + 1):
             if attempt:
                 self.sleep(min(2 ** attempt, 30))
@@ -131,8 +132,10 @@ class ImgBBClient:
                 except ValueError as e:
                     raise ImgBBError("ImgBB ne valid JSON nahi diya.") from e
             msg = redact(_error_message(text), self._key)
-            if resp.status == 429:
-                last = f"HTTP 429 rate limit: {msg}"
+            # ImgBB rate limit kabhi 429 deta hai, kabhi HTTP 400 + "Rate limit reached." (asli logs me yahi aaya)
+            if resp.status == 429 or (resp.status == 400 and re.search(r"rate.?limit", msg, re.I)):
+                rate_limited = True
+                last = f"HTTP {resp.status} rate limit: {msg}"
                 ra = resp.headers.get("retry-after", "")
                 if ra.isdigit() and int(ra) <= 60 and attempt < self.max_retries:
                     self.sleep(int(ra))
@@ -143,6 +146,6 @@ class ImgBBClient:
             if resp.status in (401, 403) or re.search(r"api.{0,10}key", msg, re.I):
                 raise ImgBBFatal(f"ImgBB ne API key reject ki (HTTP {resp.status}): {msg}")
             raise ImgBBError(f"HTTP {resp.status}: {msg}")
-        if last.startswith("HTTP 429"):
+        if rate_limited:
             raise ImgBBFatal(f"ImgBB rate limit, retries ke baad bhi: {last}. Thodi der baad dobara chalao.")
         raise ImgBBError(f"Retries ke baad bhi fail: {last}")
