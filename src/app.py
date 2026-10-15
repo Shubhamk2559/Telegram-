@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -29,6 +30,7 @@ from .app_config import AppConfig, load_app_config
 from .config import ConfigError
 from .db import Database, DBError, Lease, migrate
 from .db_stores import PostStore
+from .fast_download import MIN_SIZE, connections_from_env, parallel_download
 from .jobs import JobError, JobRepo
 from .supervisor import acquire_lease  # noqa: F401 - app.acquire_lease naam bhi chalta rahe
 from .legacy_import import import_legacy
@@ -82,14 +84,28 @@ async def connect_client(cfg: AppConfig, factory=None, timeout: float = 90.0):
 class _Tracked:
     """download_zip sirf client.download_media use karta hai: usme live-progress callback jod do (download_zip ko chhue bina)."""
 
-    def __init__(self, client, cb):
-        self._c, self._cb = client, cb
+    def __init__(self, client, cb, connections: int = 1):
+        self._c, self._cb, self._n = client, cb, connections
 
     async def download_media(self, message, file=None, progress_callback=None, **kw):
         def both(done, total):
-            self._cb(done, total)
+            if self._cb:
+                self._cb(done, total)
             if progress_callback:
                 progress_callback(done, total)
+        f = getattr(message, "file", None)
+        if self._n > 1 and isinstance(file, str) and not kw and f and int(f.size or 0) >= MIN_SIZE:
+            try:  # N hisson me ek saath download (DOWNLOAD_CONNECTIONS); koi bhi dikkat => neeche normal download
+                await parallel_download(self._c, message, file, self._n, both)
+                return file
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("Parallel download fail (%s: %s): normal download par ja raha hu.", type(e).__name__, e)
+                try:
+                    os.unlink(file)
+                except OSError:
+                    pass
         return await self._c.download_media(message, file=file, progress_callback=both, **kw)
 
 
@@ -100,6 +116,8 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     from .http_util import UrllibHttp
     from .upload_bots import LazyBotChannel, active_key
     import importlib.util
+    dl_conns = connections_from_env()
+    log.info("Download connections: %d (DOWNLOAD_CONNECTIONS; 1 = purana single download)", dl_conns)
     if importlib.util.find_spec("cryptg") is None:
         log.warning("cryptg install nahi hai: Telegram download/upload bohot slow rahega (pip install cryptg).")
     else:
@@ -146,7 +164,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         if not msg or not getattr(msg, "file", None):
             raise ArchiveGone(f"ZIP message {job['message_id']} channel me ab nahi hai.")
         z = ZipMessage(job["message_id"], job["filename"], int(msg.file.size or job["size"] or 0), msg.date, msg)
-        return await download_zip(_Tracked(client, live.on_download) if live else client, source, z, s)
+        return await download_zip(_Tracked(client, live.on_download if live else None, dl_conns), source, z, s)
 
     async def download_media(job: dict, dest: Path) -> list[dict]:
         """Batch (seedhe bheje image/video) ke messages dest/images|videos me download. ZIP ki tarah .part -> size check -> rename."""
@@ -162,7 +180,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         free = shutil.disk_usage(dest).free
         if free < total + s.limits.min_free_bytes:
             raise DownloadError(f"Disk space kam: {free // MB} MB free, chahiye ~{(total + s.limits.min_free_bytes) // MB} MB")
-        tracked = _Tracked(client, live.on_download) if live else client
+        tracked = _Tracked(client, live.on_download if live else None, dl_conns)
         out = []
         for m, sp in got:
             p = Path(sp["name"])
