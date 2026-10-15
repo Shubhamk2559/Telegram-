@@ -42,7 +42,7 @@ RATE_RE = re.compile(
 )
 ERROR_RE = re.compile(
     r"unsupported|not supported|too (large|big)|file is too|failed|error|invalid|couldn.?t|could not|unable to"
-    r"|not allowed|banned|blocked|forbidden",
+    r"|not allowed|banned|blocked|forbidden|smaller than|larger files",
     re.I,
 )
 
@@ -92,6 +92,11 @@ def looks_rate_limited(text: str) -> bool:
 
 def looks_bot_error(text: str) -> bool:
     return bool(ERROR_RE.search(text or ""))
+
+
+def looks_progress(text: str, pattern: str) -> bool:
+    """Bot ka 'Downloading the file, please wait...' jaisa beech ka message (pattern UploaderConfig.progress_re se)."""
+    return bool(pattern) and bool(re.search(pattern, text or "", re.I))
 
 
 def excerpt(text: str, n: int = 200) -> str:
@@ -272,6 +277,9 @@ class UploaderConfig:
     max_flood_wait: int = 900
     max_flood_retries: int = 5
     delete_after_link: bool = True  # link DB me save hone ke baad bot chat se video + link wale messages hata do
+    # --- bots jo video ko reply nahi karte (e.g. FlezenUploadBot) ---
+    progress_re: str = ""           # "Downloading the file, please wait..." jaisa beech ka message (link nahi, error nahi)
+    reply_to_video: bool = True     # False = bot link ko video ka reply nahi banata; cleanup chat me video ke baad ke saare messages hatata hai
 
 
 @dataclass
@@ -372,7 +380,7 @@ class DiskWalaUploader:
         st = self.store
         st.update(rec, status=UPLOADING, error=None, url=None, urls=[], match=None, needs_review=False,
                   bot_reply_excerpt=None, sent_message_id=None, reply_message_id=None,
-                  attempts=rec["attempts"] + 1, started_at=utc_now(), finished_at=None)
+                  attempts=rec["attempts"] + 1, started_at=utc_now(), finished_at=None, bot=self.cfg.bot_username)
         try:
             path = self._check_file(rec)
             sent_id = await self._send(rec, path)
@@ -450,6 +458,7 @@ class DiskWalaUploader:
         deadline = self.now() + cfg.response_timeout
         seen: dict[int, tuple] = {}
         last_texts: list[str] = []
+        progress_id = 0  # is video ke baad bot ka pehla "Downloading..." message (0 = abhi nahi aaya)
         while True:
             for r in sorted(await self.channel.fetch_replies(sent_id), key=lambda x: x.id):
                 if r.id <= sent_id or r.reply_to_id not in (None, sent_id):
@@ -474,10 +483,17 @@ class DiskWalaUploader:
                     deadline = self.now() + cfg.response_timeout
                     continue
                 if urls:
-                    return self._link(rec, r, urls, sent_id)
+                    return self._link(rec, r, urls, sent_id, progress_id=progress_id)
                 if looks_bot_error(r.text):
                     return Outcome("bot_error", reply_id=r.id, excerpt=excerpt(r.text),
                                    error=f"Bot ne error bataya: '{excerpt(r.text)}'")
+                if looks_progress(r.text, cfg.progress_re):
+                    # Bot ne file le li aur kaam shuru kiya: link late aayega, to timeout is message se dobara naapo.
+                    progress_id = progress_id or r.id
+                    deadline = self.now() + cfg.response_timeout
+                    self.ui.status(f"Bot ne file li: '{excerpt(r.text, 60)}'. Link ka intezaar...")
+                    last_texts.append(excerpt(r.text))
+                    continue
                 last_texts.append(excerpt(r.text) or "(bina text ka reply)")
                 self.ui.status(f"Bot: {excerpt(r.text, 80)}")
             if self.now() >= deadline:
@@ -507,19 +523,26 @@ class DiskWalaUploader:
             if out.reply_id:
                 ids.add(out.reply_id)
             for r in await self.channel.fetch_replies(sent_id):
-                if r.id > sent_id and r.reply_to_id == sent_id:  # sirf isi video ke replies (progress/link)
+                if r.id <= sent_id:
+                    continue
+                if r.reply_to_id == sent_id:  # isi video ke replies (progress/link)
                     ids.add(r.id)
+                elif r.reply_to_id is None and not self.cfg.reply_to_video:
+                    ids.add(r.id)  # bot reply nahi karta: "Downloading..." + link wale messages bhi isi video ke hain (strict sequential)
             await delete(sorted(ids))
             log.info("[%s] Bot chat se %d message(s) delete (video + link reply).", rec.get("filename"), len(ids))
         except Exception as e:  # noqa: BLE001 - cleanup fail hone se link nahi jaata
             log.warning("[%s] Chat cleanup fail (%s: %s): link safe hai.", rec.get("filename"), type(e).__name__, e)
 
-    def _link(self, rec: dict, r: BotReply, urls: list, sent_id: int, match: str | None = None) -> Outcome:
+    def _link(self, rec: dict, r: BotReply, urls: list, sent_id: int, match: str | None = None,
+              progress_id: int = 0) -> Outcome:
         if match is None:
             if r.reply_to_id == sent_id:
                 match = "reply_to"
             elif rec["filename"].lower() in (r.text or "").lower():
                 match = "filename"
+            elif progress_id and sent_id < progress_id <= r.id:  # <= : bot ne wahi message edit karke link bana diya ho
+                match = "progress"  # hamari file -> bot ka "Downloading..." -> link: pakka sequence, galat video ka khatra nahi
             else:
                 match = "sequential"
         return Outcome("link", urls=urls, reply_id=r.id, match=match, excerpt=excerpt(r.text))
@@ -529,7 +552,7 @@ class DiskWalaUploader:
         now = utc_now()
         if out.kind == "link":
             review = out.match == "sequential" and self._attribution_risk
-            if out.match in ("reply_to", "filename", "user_confirmed"):
+            if out.match in ("reply_to", "filename", "progress", "user_confirmed"):
                 self._attribution_risk = False
             st.update(rec, status=COMPLETED, url=out.urls[0], urls=out.urls, error=None, match=out.match,
                       reply_message_id=out.reply_id, bot_reply_excerpt=out.excerpt, needs_review=review, finished_at=now)
