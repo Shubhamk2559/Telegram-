@@ -190,6 +190,19 @@ class TelethonBotChannel:
         return (await self.client.send_message(self.entity, text)).id
 
     async def send_video(self, path: Path, progress) -> int:
+        from . import fast_upload
+        n = fast_upload.connections_from_env()
+        if n > 1 and self.as_document and Path(path).stat().st_size >= fast_upload.MIN_SIZE:
+            try:  # UPLOAD_CONNECTIONS parts ek saath; koi bhi dikkat (kuch bheja nahi gaya) => neeche normal send_file
+                msg = await fast_upload.send_file_parallel(self.client, self.entity, str(path), progress, n)
+                return msg.id
+            except asyncio.CancelledError:
+                raise
+            except fast_upload.SendPhaseError as e:
+                raise (e.__cause__ or e)  # asli error upar: _send() flood/fatal/transient (+ duplicate check) wahi sambhalta hai
+            except Exception as e:  # noqa: BLE001 - upload phase fail / media accept nahi hua: kuch bheja nahi gaya
+                logging.getLogger("diskwala").warning("Parallel upload fail (%s: %s): normal upload par ja raha hu.",
+                                                      type(e).__name__, e)
         msg = await self.client.send_file(
             self.entity, str(path), force_document=self.as_document,
             supports_streaming=not self.as_document, progress_callback=progress)
