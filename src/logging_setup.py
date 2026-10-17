@@ -6,7 +6,7 @@ import os
 import re
 from urllib.parse import urlparse
 
-SECRET_ENV = ("API_HASH", "TELEGRAM_API_HASH", "SESSION_STRING", "TELEGRAM_SESSION_STRING", "IMGBB_API_KEY",
+SECRET_ENV = ("API_HASH", "TELEGRAM_API_HASH", "SESSION_STRING", "TELEGRAM_SESSION_STRING", "IMGBB_API_KEY", "IMGBB_API_KEYS",
               "TELEGRAPH_ACCESS_TOKEN", "DATABASE_URL")
 PATTERNS = [re.compile(r"(?i)(key|access_token|token|password|session)=([^&\s\"']+)")]
 
@@ -18,6 +18,8 @@ def secret_values(env=os.environ) -> list[str]:
         if not v:
             continue
         out.append(v)
+        if k == "IMGBB_API_KEYS":  # har key alag mask ho (poori list ek string me match nahi hoti)
+            out.extend(p for p in re.split(r"[,;\s]+", v) if p)
         if k == "DATABASE_URL":
             pw = urlparse(v).password
             if pw:
