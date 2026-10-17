@@ -47,7 +47,10 @@ def preflight(cfg: AppConfig, *, env=os.environ, free_bytes: int | None = None, 
             "Local session file mili." if has_file else "Session nahi: `python -m src.main login` chalao, phir `python -m src.app export-session`.")
     add(OK if cfg.dest_id is not None else ERROR, "destination",
         "FINAL_POST_DESTINATION_ID set hai." if cfg.dest_id is not None else "FINAL_POST_DESTINATION_ID set nahi hai.")
-    add(OK if s.imgbb_api_key else ERROR, "imgbb", "IMGBB_API_KEY set hai." if s.imgbb_api_key else "IMGBB_API_KEY set nahi hai.")
+    n_keys = len(s.all_imgbb_keys())
+    add(OK if n_keys else ERROR, "imgbb",
+        (f"{n_keys} ImgBB API key set hain (rate limit par agli key chalegi)." if n_keys > 1 else "IMGBB_API_KEY set hai.")
+        if n_keys else "IMGBB_API_KEY (ya IMGBB_API_KEYS) set nahi hai.")
     if s.telegraph_token:
         add(OK, "telegraph_token", "TELEGRAPH_ACCESS_TOKEN set hai.")
     else:
