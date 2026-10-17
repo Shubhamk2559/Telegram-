@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import mimetypes
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -31,6 +33,10 @@ class ImgBBError(Exception):
 
 class ImgBBFatal(ImgBBError):
     """Poora batch rokna chahiye (galat API key, rate limit...). Bypass nahi karte."""
+
+
+class ImgBBRateLimited(ImgBBFatal):
+    """Is API key par rate limit lagi. Multi-key pool me dusri key try hoti hai; akeli key ho to batch ruk kar wait karta hai."""
 
 
 def redact(text: str, secret: str) -> str:
@@ -148,5 +154,79 @@ class ImgBBClient:
                 raise ImgBBFatal(f"ImgBB ne API key reject ki (HTTP {resp.status}): {msg}")
             raise ImgBBError(f"HTTP {resp.status}: {msg}")
         if rate_limited:
-            raise ImgBBFatal(f"ImgBB rate limit, retries ke baad bhi: {last}. Thodi der baad dobara chalao.")
+            raise ImgBBRateLimited(f"ImgBB rate limit, retries ke baad bhi: {last}. Thodi der baad dobara chalao.")
         raise ImgBBError(f"Retries ke baad bhi fail: {last}")
+
+
+# ----------------------------------------------------------------------------- multiple API keys
+log = logging.getLogger("imgbb")
+
+
+class ImgBBPool:
+    """Ek se zyada ImgBB API keys. Interface ImgBBClient jaisa: upload(path, name) -> dict.
+
+    - Keys barabari se (round-robin) chalti hain, taaki kisi ek key par limit jaldi na lage.
+    - Kisi key par rate limit lage => wo `cooldown` seconds ke liye side me, SAME image turant agli key se upload hoti hai.
+    - Galat/reject hui key => is run me band, baaki keys chalti rahengi.
+    - Sab keys limit/band ho to ImgBBFatal (worker wahi purana wait/pause karta hai).
+    Upload ka result sirf upload hone par DB me save hota hai; image dobara upload nahi hoti, to uska URL kabhi nahi badalta.
+    """
+
+    def __init__(self, clients: list, *, cooldown: float = 120.0, now: Callable[[], float] = time.monotonic):
+        if not clients:
+            raise ImgBBFatal("Koi ImgBB API key nahi.")
+        self._clients = list(clients)
+        self._cool_until = [0.0] * len(self._clients)
+        self._dead = [False] * len(self._clients)
+        self._i = 0
+        self._cooldown, self._now = cooldown, now
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._clients)
+
+    def _pick(self, tried: set) -> int | None:
+        n, t = len(self._clients), self._now()
+        for step in range(n):
+            j = (self._i + step) % n
+            if j not in tried and not self._dead[j] and self._cool_until[j] <= t:
+                self._i = (j + 1) % n
+                return j
+        return None
+
+    def upload(self, path: Path, name: str | None = None) -> dict:
+        tried: set[int] = set()
+        rate_hit = False
+        last_reject: ImgBBFatal | None = None
+        while True:
+            with self._lock:
+                j = self._pick(tried)
+            if j is None:
+                break
+            tried.add(j)
+            try:
+                return self._clients[j].upload(path, name)
+            except ImgBBRateLimited:
+                rate_hit = True
+                with self._lock:
+                    self._cool_until[j] = self._now() + self._cooldown
+                log.warning("ImgBB key #%d par rate limit: %ds side me, agli key try ho rahi hai.", j + 1, int(self._cooldown))
+            except ImgBBFatal as e:  # key reject (galat/expired)
+                last_reject = e
+                with self._lock:
+                    self._dead[j] = True
+                log.error("ImgBB key #%d reject hui, is run me band: %s", j + 1, e)
+        t = self._now()
+        cooling = any(not d and c > t for d, c in zip(self._dead, self._cool_until))
+        if rate_hit or cooling:
+            raise ImgBBRateLimited(f"ImgBB rate limit: sab {len(self._clients)} key(s) par limit lagi hai. Thodi der baad dobara chalao.")
+        raise last_reject or ImgBBFatal("ImgBB: koi bhi API key kaam ki nahi.")
+
+
+def make_imgbb(keys, http: Http, *, max_retries: int = 3, cooldown: float = 120.0):
+    """1 key => seedha ImgBBClient (purana behaviour); 2+ keys => ImgBBPool."""
+    keys = [k for k in keys if k]
+    if not keys:
+        raise ImgBBFatal("IMGBB_API_KEY khaali hai.")
+    clients = [ImgBBClient(k, http, max_retries=max_retries) for k in keys]
+    return clients[0] if len(clients) == 1 else ImgBBPool(clients, cooldown=cooldown)
