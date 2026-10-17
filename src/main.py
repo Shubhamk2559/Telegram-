@@ -208,7 +208,7 @@ def _imgbb_upload(args) -> int:
     if not work:
         print("\nUpload karne ko kuch pending nahi hai.")
         return 0
-    if not s.imgbb_api_key:
+    if not s.all_imgbb_keys():
         raise ConfigError("IMGBB_API_KEY nahi mili. '.env' me daalo (https://api.imgbb.com/ se milti hai).")
     if not args.yes:
         if not sys.stdin.isatty():
@@ -217,7 +217,8 @@ def _imgbb_upload(args) -> int:
         if input(f"\n{len(work)} images ImgBB par bhejni hain. Shuru karein? (y/n): ").strip().lower() != "y":
             print("Cancel.")
             return 0
-    client = ImgBBClient(s.imgbb_api_key, UrllibHttp(), max_retries=s.imgbb_retries)
+    from .imgbb_uploader import make_imgbb
+    client = make_imgbb(s.all_imgbb_keys(), UrllibHttp(), max_retries=s.imgbb_retries, cooldown=s.imgbb_key_cooldown)
     run = upload_images(store, client, work, s.workspace, delay=s.imgbb_delay)
     print(f"\nUploaded: {run.uploaded}, failed: {run.failed}  |  status: {store.counts()}")
     if run.stopped_reason:
