@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,11 +48,21 @@ class Settings:
     max_flood_wait: int = 900
     # --- Part 3 (ImgBB + Telegraph) ---
     imgbb_api_key: str = field(default="", repr=False)
+    imgbb_api_keys: tuple = field(default=(), repr=False)   # IMGBB_API_KEYS: comma/space/newline se alag
+    imgbb_key_cooldown: float = 120.0
     imgbb_retries: int = 3
     imgbb_delay: float = 0.5
     telegraph_token: str = field(default="", repr=False)
     telegraph_title: str = "Gallery"
     telegraph_author: str = ""
+
+    def all_imgbb_keys(self) -> list:
+        """IMGBB_API_KEY + IMGBB_API_KEYS, duplicate hata kar, order wahi."""
+        out: list = []
+        for k in (self.imgbb_api_key, *self.imgbb_api_keys):
+            if k and k not in out:
+                out.append(k)
+        return out
 
     @property
     def downloads_dir(self) -> Path:
@@ -147,6 +158,8 @@ def load_settings(require_api: bool = True) -> Settings:
         upload_delay=_num("UPLOAD_DELAY_SECONDS", 3.0, float),
         max_flood_wait=_num("MAX_FLOOD_WAIT_SECONDS", 900),
         imgbb_api_key=os.getenv("IMGBB_API_KEY", "").strip(),
+        imgbb_api_keys=tuple(k for k in re.split(r"[,;\s]+", os.getenv("IMGBB_API_KEYS", "")) if k),
+        imgbb_key_cooldown=_num("IMGBB_KEY_COOLDOWN_SECONDS", 120.0, float),
         imgbb_retries=_num("IMGBB_RETRIES", 3),
         imgbb_delay=_num("IMGBB_DELAY_SECONDS", 0.5, float),
         telegraph_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip(),
