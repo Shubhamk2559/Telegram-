@@ -38,6 +38,7 @@ from .telegraph_publisher import METHOD_EMBED, TelegraphClient
 from .tg_publisher import PostPublisher, PublishBlocked
 from .upload_store import COMPLETED, collect_videos
 from . import memtrim
+from .prefetch import Prefetcher
 from .zip_processor import (
     ArchiveCorrupted, ArchiveRejected, ExtractionResult, InsufficientSpace, Limits, extract_archive, sha256_file,
 )
@@ -146,6 +147,8 @@ class WorkerConfig:
     cleanup: bool = True
     lease_ttl: float = 120.0
     bot_username: str = "DiskWalaFileUploaderBot"
+    prefetch_next: bool = True            # videos ke link ka wait karte waqt agla ZIP download (PREFETCH_NEXT_ZIP)
+    prefetch_interval: float = 60.0       # itne seconds me dobara check ki agla ZIP aaya ya nahi
 
 
 @dataclass
@@ -161,6 +164,7 @@ class Ports:
     extract: Callable[[Path, Path, Limits], object] = extract_archive
     download_media: Callable[[dict, Path], Awaitable[list]] | None = None  # seedhe bheje image/video batch ka download
     ensure_connected: Callable[[], Awaitable[None]] | None = None  # Telegram reconnect hook
+    prefetch: Callable[[dict], Awaitable[Path]] | None = None  # agla ZIP pehle se download (UI progress ke bina)
 
 
 def backoff_delay(attempt: int, base: float, cap: float, rng: Callable[[], float] = random.random) -> float:
@@ -183,6 +187,7 @@ class Worker:
         self.max_crashes = 5
         self.fatal: BaseException | None = None  # session dead hui to yahan; run_worker exit code 3 deta hai
         self._task: asyncio.Task | None = None
+        self.prefetcher = Prefetcher(self.repo.peek_after, ports.prefetch, enabled=cfg.prefetch_next)
         self.on_job: Callable[[str | None], None] | None = None  # bot ka live-progress hook (job shuru/khatam)
 
     # ------------------------------------------------------------------ loop
@@ -226,6 +231,7 @@ class Worker:
                 if not worked:
                     await self._nap(self.cfg.poll_interval)
         finally:
+            await self.prefetcher.aclose()
             self.lease.release()
             log.info("Worker band.")
 
@@ -325,6 +331,7 @@ class Worker:
     async def process(self, job: dict) -> str:
         aid = job["archive_id"]
         self.current = aid
+        self.prefetcher.discard_other(aid)  # prefetch kisi aur job ka ho to rok do
         self._notify_job(aid)
         log.info("[%s] %s: process shuru (status %s)", aid, job["filename"], job["status"])
         try:
@@ -458,6 +465,7 @@ class Worker:
             res = ExtractionResult(files=await asyncio.to_thread(self._hash_media, raw, dest))
             path = None
         else:
+            await self.prefetcher.wait_for(aid)  # prefetch chal raha ho to poora hone do, phir download_zip file dekhkar skip kar dega
             path = await self._retry(aid, "download", lambda: self._download(job))
             self._check_stop()
             self.repo.transition(aid, EXTRACTING)
@@ -610,12 +618,25 @@ class Worker:
             await uploader.prepare()
             self._prepared.add(bot_key)
         total = len(store.files)
+        watcher = None
+        if self.prefetcher.enabled:
+            self.prefetcher.kick(aid)  # abhi shuru (scheduling par nirbhar nahi); agla ZIP baad me aaye to watcher pakdega
+            watcher = asyncio.create_task(self._prefetch_watch(aid))
         try:
             await uploader.process_all(store.files)
         except VideoBlocked as e:
             raise StagePause(f"DiskWala: {e}") from e
         finally:
+            if watcher is not None:  # sirf dekhne wala loop band; shuru ho chuka download chalta rehta hai (agle job ke liye)
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
             self.repo.set_progress(aid, {"videos_done": sum(v["status"] == COMPLETED for v in store.files), "videos_total": total})
+
+    async def _prefetch_watch(self, aid: str) -> None:
+        """Videos ke link ka intezaar chal raha hai: agla ZIP queue me aa jaye to download shuru (real sleep: tests me fake sleep spin na kare)."""
+        while True:
+            self.prefetcher.kick(aid)
+            await asyncio.sleep(self.cfg.prefetch_interval)
 
     async def _stage_posts(self, aid: str) -> None:
         if self.posts.list(aid):
