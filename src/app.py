@@ -122,7 +122,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         log.warning("cryptg install nahi hai: Telegram download/upload bohot slow rahega (pip install cryptg).")
     else:
         log.info("cryptg ON: fast Telegram encryption.")
-    from .imgbb_uploader import ImgBBClient
+    from .imgbb_uploader import ImgBBClient, make_imgbb
     from .scanner import scan_channel
     from .strict_videos import StrictVideoUploader
     from .telegraph_publisher import TelegraphClient
@@ -130,8 +130,8 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     from .worker import ArchiveGone, Ports, Worker
 
     s = cfg.settings
-    if not s.imgbb_api_key:
-        raise ConfigError("IMGBB_API_KEY set nahi hai.")
+    if not s.all_imgbb_keys():
+        raise ConfigError("IMGBB_API_KEY (ya IMGBB_API_KEYS) set nahi hai.")
     if cfg.dest_id is None:
         raise ConfigError("FINAL_POST_DESTINATION_ID set nahi hai.")
     source = await resolve_channel(client, s.channel_name, s.channel_id)
@@ -159,12 +159,19 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     tg = TelegraphClient(http)
     ensure_token_db(tg, s.telegraph_token, repo, s.telegraph_author)
 
-    async def download(job: dict) -> Path:
+    async def _fetch_zip(job: dict, cb) -> Path:
         msg = await client.get_messages(source.entity, ids=job["message_id"])
         if not msg or not getattr(msg, "file", None):
             raise ArchiveGone(f"ZIP message {job['message_id']} channel me ab nahi hai.")
         z = ZipMessage(job["message_id"], job["filename"], int(msg.file.size or job["size"] or 0), msg.date, msg)
-        return await download_zip(_Tracked(client, live.on_download if live else None, dl_conns), source, z, s)
+        return await download_zip(_Tracked(client, cb, dl_conns), source, z, s)
+
+    async def download(job: dict) -> Path:
+        return await _fetch_zip(job, live.on_download if live else None)
+
+    async def prefetch(job: dict) -> Path:
+        """Agla ZIP background me. UI callback nahi: chal rahe job ke status card par download % na aaye."""
+        return await _fetch_zip(job, None)
 
     async def download_media(job: dict, dest: Path) -> list[dict]:
         """Batch (seedhe bheje image/video) ke messages dest/images|videos me download. ZIP ki tarah .part -> size check -> rename."""
@@ -206,8 +213,8 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     ports = Ports(
         scan=lambda: scan_channel(client, source.entity, source.id, repo, backfill_from=cfg.backfill_from,
                                   media_batches=cfg.media_batches, quiet_seconds=cfg.media_quiet),
-        download=download, download_media=download_media,
-        imgbb=ImgBBClient(s.imgbb_api_key, http, max_retries=s.imgbb_retries),
+        download=download, download_media=download_media, prefetch=prefetch,
+        imgbb=make_imgbb(s.all_imgbb_keys(), http, max_retries=s.imgbb_retries, cooldown=s.imgbb_key_cooldown),
         telegraph=tg, http=http,
         make_uploader=make_uploader,
         publisher=PostPublisher(TelethonDestination(client, dest.entity, cfg.link_preview), PostStore(db), cfg.publish_policy),
