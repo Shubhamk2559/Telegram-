@@ -101,6 +101,14 @@ class JobRepo:
             return Selection(blocked_by=row)
         return Selection(job=row)
 
+    def peek_after(self, archive_id: str) -> dict | None:
+        """Sirf padhna (claim/badlav nahi): archive_id ke baad queue me kaun chalega. Wo QUEUED na ho (PAUSED => queue wahan
+        ruki rahegi, ya pipeline me atka) to None. Prefetch isse decide karta hai."""
+        row = _decode(self.db.query_one(
+            "SELECT * FROM archives WHERE status NOT IN (?, ?) AND archive_id != ? ORDER BY message_id, chat_id LIMIT 1",
+            (*TERMINAL, archive_id)))
+        return row if row is not None and row["status"] == QUEUED else None
+
     # ---- transitions --------------------------------------------------------
     def transition(self, archive_id: str, status: str, *, stage: str | None = None,
                    progress: dict | None = None, error: str | None = None) -> None:
