@@ -50,6 +50,8 @@ class DbUploadStore(UploadStore):
         rows = db.query("SELECT data FROM videos WHERE archive_id = ? ORDER BY ord, file_id", (archive_id,))
         files = [json.loads(r["data"]) for r in rows]
         for rec in files:
+            if rec.get("src_msg_id"):  # forward hone wala video: disk par file hoti hi nahi
+                continue
             p = Path(rec["path"])
             rec["path"] = str(p if p.is_absolute() else self.workspace / p)
         self.data = {"schema_version": 1, "bot": bot, "updated_at": now_iso(), "files": files}
@@ -61,7 +63,7 @@ class DbUploadStore(UploadStore):
             return path
 
     def _persist(self, rec: dict) -> None:
-        row = {**rec, "path": self._rel(rec["path"])}
+        row = rec if rec.get("src_msg_id") else {**rec, "path": self._rel(rec["path"])}
         self.db.execute(
             "INSERT INTO videos (archive_id, file_id, ord, data, updated_at) VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT (archive_id, file_id) DO UPDATE SET ord = EXCLUDED.ord, data = EXCLUDED.data, "
@@ -72,6 +74,9 @@ class DbUploadStore(UploadStore):
         """Naye videos ke paths turant absolute (Part 2 ka relative-path bug yahin band hota hai)."""
         fixed = []
         for v in videos:
+            if v.get("src_msg_id"):
+                fixed.append(v)
+                continue
             p = Path(v["path"])
             fixed.append({**v, "path": str(p if p.is_absolute() else self.workspace / p)})
         return super().sync(fixed)
