@@ -70,6 +70,12 @@ class DbUploadStore(UploadStore):
             "updated_at = EXCLUDED.updated_at",
             (self.archive_id, rec["file_id"], self.files.index(rec), json.dumps(row), now_iso()))
 
+    def drop(self, rec: dict) -> None:
+        """Record hata do (source message delete ho gaya)."""
+        self.db.execute("DELETE FROM videos WHERE archive_id = ? AND file_id = ?", (self.archive_id, rec["file_id"]))
+        self.files.remove(rec)
+        self.save()
+
     def sync(self, videos: list[dict]) -> int:
         """Naye videos ke paths turant absolute (Part 2 ka relative-path bug yahin band hota hai)."""
         fixed = []
