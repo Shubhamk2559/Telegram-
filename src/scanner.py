@@ -1,13 +1,13 @@
-"""File Manager channel ko scan karke naye ZIPs aur seedhe bheje image/video batches queue me daalna.
+"""Saved Messages (ya koi bhi source chat) ko scan karke image/video batches queue me daalna. ZIP SUPPORT HATA DIYA GAYA.
 
 - Checkpoint (last_scanned message id) DB me; offline rehne par jo ZIP aaye wo agle scan me mil jaate hain.
-- Non-ZIP aur non-media messages ignore, par checkpoint unke upar bhi aage badhta hai.
+- ZIP aur non-media messages ignore, par checkpoint unke upar bhi aage badhta hai.
 - PEHLI baar (checkpoint nahi) default me purani history backfill NAHI hoti (warna poori channel history
   dobara process/publish ho jaati). Backfill ke liye SCAN_BACKFILL_FROM_MESSAGE_ID ya `enqueue --from-message-id`.
 
 Seedhe bheje image/video (ZIP ke bina) - BATCH rule:
   image(s) phir video(s) = ek batch (ek "folder"). Video ke baad jaise hi nayi image aaye, naya batch shuru.
-  Batch tab "band" maana jata hai jab (a) uske baad nayi image aaye, ya (b) ZIP aaye, ya (c) aakhri message ko
+  Batch tab "band" maana jata hai jab (a) uske baad nayi image aaye, ya (b) -, ya (c) aakhri message ko
   `quiet_seconds` beet jayein. Tab tak batch queue me nahi jaata aur checkpoint uske pehle message par ruka rehta hai
   (taaki user ke aur videos bhejte rehne par woh isi batch me aayein).
 """
@@ -97,11 +97,6 @@ async def scan_channel(client, entity, chat_id: int, repo: JobRepo, *, backfill_
 
     async for msg in client.iter_messages(entity, min_id=min_id, reverse=True):  # oldest -> newest
         top = max(top, msg.id)
-        info = zip_info(msg)
-        if info:
-            flush()  # ZIP aane se pehle ka batch band
-            new += repo.discover(chat_id, msg.id, info[0], info[1], msg.date.isoformat() if msg.date else None)
-            continue
         if not media_batches:
             continue
         m = media_info(msg)
