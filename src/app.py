@@ -110,7 +110,7 @@ class _Tracked:
 
 
 async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, lease: Lease | None = None, live=None):
-    from .channel_reader import DownloadError, ZipMessage, download_zip, resolve_channel
+    from .channel_reader import DownloadError, resolve_channel, resolve_source
     from .zip_processor import MB, safe_name
     from .diskwala_uploader import TelethonBotChannel
     from .http_util import UrllibHttp
@@ -134,7 +134,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         raise ConfigError("IMGBB_API_KEY (ya IMGBB_API_KEYS) set nahi hai.")
     if cfg.dest_id is None:
         raise ConfigError("FINAL_POST_DESTINATION_ID set nahi hai.")
-    source = await resolve_channel(client, s.channel_name, s.channel_id)
+    source = await resolve_source(client, s.channel_name, s.channel_id)  # CHANNEL_NAME=Saved Messages
     dest = await resolve_channel(client, "", cfg.dest_id)
     # Active bot (DB me /switchbot se badla hua, warna env default) ko pehle hi connect karo: galat username startup par pakda jaye.
     # Dusre bot lazy hain: switch ke baad pehli use par connect hote hain.
@@ -147,6 +147,12 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
         else:
             channels[key] = LazyBotChannel(client, prof.username, s.upload_as_document)
     legacy_bot = None if bots else await TelethonBotChannel.connect(client, s.diskwala_bot, s.upload_as_document)
+    send_mode = (os.environ.get("VIDEO_SEND_MODE") or "media").strip().lower()
+    if send_mode not in ("media", "forward"):
+        raise ConfigError("VIDEO_SEND_MODE 'media' ya 'forward' hona chahiye.")
+    log.info("Video bhejne ka tarika: %s (download/upload nahi, Telegram server-side).", send_mode)
+    for ch in list(channels.values()) + ([legacy_bot] if legacy_bot else []):
+        ch.source, ch.video_mode = source.entity, send_mode
 
     def make_uploader(store):
         if not bots:  # purane tests/configs (bots={}) ke liye pehle jaisa
@@ -159,40 +165,34 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     tg = TelegraphClient(http)
     ensure_token_db(tg, s.telegraph_token, repo, s.telegraph_author)
 
-    async def _fetch_zip(job: dict, cb) -> Path:
-        msg = await client.get_messages(source.entity, ids=job["message_id"])
-        if not msg or not getattr(msg, "file", None):
-            raise ArchiveGone(f"ZIP message {job['message_id']} channel me ab nahi hai.")
-        z = ZipMessage(job["message_id"], job["filename"], int(msg.file.size or job["size"] or 0), msg.date, msg)
-        return await download_zip(_Tracked(client, cb, dl_conns), source, z, s)
-
-    async def download(job: dict) -> Path:
-        return await _fetch_zip(job, live.on_download if live else None)
-
-    async def prefetch(job: dict) -> Path:
-        """Agla ZIP background me. UI callback nahi: chal rahe job ke status card par download % na aaye."""
-        return await _fetch_zip(job, None)
-
     async def download_media(job: dict, dest: Path) -> list[dict]:
-        """Batch (seedhe bheje image/video) ke messages dest/images|videos me download. ZIP ki tarah .part -> size check -> rename."""
+        """Batch ke messages: IMAGES dest/images me download (ImgBB/Telegraph ke liye).
+        VIDEOS download NAHI hote: sirf check hota hai ki message hai, aur {"remote": True, msg_id, name, size} lautta hai.
+        Video baad me Telegram server-side bot ko jaata hai => video ka bandwidth ~0."""
         import re
         import shutil
         specs = job.get("media") or []
         msgs = await client.get_messages(source.entity, ids=[int(m["id"]) for m in specs])
         got = [(m, sp) for m, sp in zip(msgs, specs) if m and getattr(m, "file", None)]
         if not got:
-            raise ArchiveGone(f"Batch {job['archive_id']} ke saare messages channel me ab nahi hain.")
-        total = sum(int(m.file.size or sp.get("size") or 0) for m, sp in got)
-        dest.mkdir(parents=True, exist_ok=True)
-        free = shutil.disk_usage(dest).free
-        if free < total + s.limits.min_free_bytes:
-            raise DownloadError(f"Disk space kam: {free // MB} MB free, chahiye ~{(total + s.limits.min_free_bytes) // MB} MB")
+            raise ArchiveGone(f"Batch {job['archive_id']} ke saare messages source chat me ab nahi hain.")
+        imgs = [(m, sp) for m, sp in got if sp["kind"] == "image"]
+        total = sum(int(m.file.size or sp.get("size") or 0) for m, sp in imgs)
+        if imgs:
+            dest.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(dest).free
+            if free < total + s.limits.min_free_bytes:
+                raise DownloadError(f"Disk space kam: {free // MB} MB free, chahiye ~{(total + s.limits.min_free_bytes) // MB} MB")
         tracked = _Tracked(client, live.on_download if live else None, dl_conns)
         out = []
-        for m, sp in got:
+        for m, sp in got:  # message order
+            if sp["kind"] == "video":
+                out.append({"type": "video", "remote": True, "msg_id": int(m.id), "name": sp["name"],
+                            "size": int(m.file.size or sp.get("size") or 0)})
+                continue
             p = Path(sp["name"])
             name = f"{m.id}_{safe_name(p.stem, 80)}{re.sub(r'[^A-Za-z0-9.]', '', p.suffix).lower()}"
-            folder = dest / ("images" if sp["kind"] == "image" else "videos")
+            folder = dest / "images"
             folder.mkdir(parents=True, exist_ok=True)
             final = folder / name
             part = final.with_name(name + ".part")
@@ -203,7 +203,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
             if want and part.stat().st_size != want:
                 raise DownloadError(f"Message {m.id} adhoora download ({part.stat().st_size} / {want} bytes).")
             part.replace(final)
-            out.append({"type": sp["kind"], "path": final, "name": name, "msg_id": m.id})
+            out.append({"type": "image", "path": final, "name": name, "msg_id": m.id})
         return out
 
     async def ensure_connected():
@@ -213,7 +213,7 @@ async def build_worker(cfg: AppConfig, db: Database, repo: JobRepo, client, leas
     ports = Ports(
         scan=lambda: scan_channel(client, source.entity, source.id, repo, backfill_from=cfg.backfill_from,
                                   media_batches=cfg.media_batches, quiet_seconds=cfg.media_quiet),
-        download=download, download_media=download_media, prefetch=prefetch,
+        download_media=download_media,
         imgbb=make_imgbb(s.all_imgbb_keys(), http, max_retries=s.imgbb_retries, cooldown=s.imgbb_key_cooldown),
         telegraph=tg, http=http,
         make_uploader=make_uploader,
@@ -332,12 +332,12 @@ def cmd_approve(db: Database, aid: str) -> int:
 
 
 async def cmd_scan(cfg: AppConfig, from_id: int | None) -> int:
-    from .channel_reader import resolve_channel
+    from .channel_reader import resolve_source
     from .scanner import scan_channel
     db, repo = _open(cfg)
     client = await connect_client(cfg)
     try:
-        src = await resolve_channel(client, cfg.settings.channel_name, cfg.settings.channel_id)
+        src = await resolve_source(client, cfg.settings.channel_name, cfg.settings.channel_id)
         info = await scan_channel(client, src.entity, src.id, repo, backfill_from=from_id or cfg.backfill_from,
                                   media_batches=cfg.media_batches, quiet_seconds=cfg.media_quiet)
         print(f"Scan: {info}")
