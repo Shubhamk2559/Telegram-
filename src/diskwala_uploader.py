@@ -189,6 +189,23 @@ class TelethonBotChannel:
     async def send_text(self, text: str) -> int:
         return (await self.client.send_message(self.entity, text)).id
 
+    source = None          # Saved Messages / source chat entity (app.py set karta hai)
+    video_mode = "media"   # media = bina "Forwarded from" ke | forward = asli forward
+
+    async def forward_video(self, msg_id: int) -> int:
+        """Video download/upload NAHI hota: Telegram server-side bot ko bhej deta hai (bandwidth ~0)."""
+        if self.source is None:
+            raise UploadFailed("Source chat set nahi hai (forward nahi ho sakta).")
+        msg = await self.client.get_messages(self.source, ids=int(msg_id))
+        if not msg or not getattr(msg, "media", None):
+            raise UploadFailed(f"Source message {msg_id} ab nahi hai (delete ho gaya).")
+        if self.video_mode == "forward":
+            sent = await self.client.forward_messages(self.entity, int(msg_id), from_peer=self.source)
+        else:
+            sent = await self.client.send_file(self.entity, msg.media)
+        sent = sent[0] if isinstance(sent, (list, tuple)) else sent
+        return sent.id
+
     async def send_video(self, path: Path, progress) -> int:
         from . import fast_upload
         n = fast_upload.connections_from_env()
@@ -418,6 +435,13 @@ class DiskWalaUploader:
             return FAILED
 
     def _check_file(self, rec: dict) -> Path:
+        if rec.get("src_msg_id"):  # forward: disk file nahi, sirf size dekho
+            size = int(rec.get("size") or 0)
+            if size <= 0:
+                raise UploadFailed("Video ka size 0/unknown hai.")
+            if size > self.cfg.max_upload_bytes:
+                raise UploadFailed(f"Telegram limit se bada: {size // MB} MB > {self.cfg.max_upload_bytes // MB} MB.")
+            return Path(f"tg_msg_{rec['src_msg_id']}")
         path = Path(rec["path"])
         if not path.is_file():
             raise UploadFailed(f"File disk par nahi mili: {rec['path']}")
@@ -435,6 +459,11 @@ class DiskWalaUploader:
         retries = floods = 0
         while True:
             try:
+                if rec.get("src_msg_id"):
+                    fwd = getattr(self.channel, "forward_video", None)
+                    if fwd is None:
+                        raise UploadFailed("Is bot channel me forward support nahi hai.")
+                    return await fwd(int(rec["src_msg_id"]))
                 return await self.channel.send_video(path, self.ui.progress)
             except asyncio.CancelledError:
                 raise
