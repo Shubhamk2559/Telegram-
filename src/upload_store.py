@@ -33,6 +33,7 @@ def _blank(video: dict) -> dict:
         "size": video["size"],
         "path": video["path"],
         "archive_id": video.get("archive_id"),
+        "src_msg_id": video.get("src_msg_id"),  # set => video download nahi hota, Telegram server-side bheja jaata hai
         "status": PENDING,
         "url": None,
         "urls": [],
