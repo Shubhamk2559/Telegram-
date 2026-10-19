@@ -80,6 +80,17 @@ async def resolve_channel(client, name: str, channel_id: int | None) -> ChannelR
         print("Galat number.")
 
 
+SAVED_NAMES = {"me", "saved", "saved messages", "saved_messages", "savedmessages"}
+
+
+async def resolve_source(client, name: str, channel_id: int | None) -> ChannelRef:
+    """CHANNEL_NAME=Saved Messages (ya `me`) => aapke apne Saved Messages. Warna purana channel lookup."""
+    if (name or "").strip().lower() in SAVED_NAMES:
+        me = await client.get_me()
+        return ChannelRef(id=int(me.id), title="Saved Messages", kind="saved", entity="me")
+    return await resolve_channel(client, name, channel_id)
+
+
 async def list_zip_messages(client, channel: ChannelRef) -> list[ZipMessage]:
     out: list[ZipMessage] = []
     async for msg in client.iter_messages(channel.entity):
