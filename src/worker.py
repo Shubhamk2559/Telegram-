@@ -39,9 +39,7 @@ from .tg_publisher import PostPublisher, PublishBlocked
 from .upload_store import COMPLETED, collect_videos
 from . import memtrim
 from .prefetch import Prefetcher
-from .zip_processor import (
-    ArchiveCorrupted, ArchiveRejected, ExtractionResult, InsufficientSpace, Limits, extract_archive, sha256_file,
-)
+from .zip_processor import ExtractionResult, Limits, sha256_file
 from .zip_telegraph import ST_FAILURES, ST_UNVERIFIED, ZipArticleError, publish_zip_article
 
 log = logging.getLogger("worker")
@@ -155,14 +153,13 @@ class WorkerConfig:
 class Ports:
     """Bahar ki duniya (Telegram/ImgBB/Telegraph/DiskWala). Tests me fakes lagte hain."""
     scan: Callable[[], Awaitable[dict]]
-    download: Callable[[dict], Awaitable[Path]]
     imgbb: ImgBBClient
     telegraph: TelegraphClient
     http: object
     make_uploader: Callable[[DbUploadStore], StrictVideoUploader]
     publisher: PostPublisher
-    extract: Callable[[Path, Path, Limits], object] = extract_archive
-    download_media: Callable[[dict, Path], Awaitable[list]] | None = None  # seedhe bheje image/video batch ka download
+    download: Callable[[dict], Awaitable[Path]] | None = None  # ZIP support hata diya: ab use nahi hota
+    download_media: Callable[[dict, Path], Awaitable[list]] | None = None  # images download + videos remote (forward)
     ensure_connected: Callable[[], Awaitable[None]] | None = None  # Telegram reconnect hook
     prefetch: Callable[[dict], Awaitable[Path]] | None = None  # agla ZIP pehle se download (UI progress ke bina)
 
@@ -415,7 +412,7 @@ class Worker:
             if r["imgbb"]["status"] != "uploaded" and not (ws / r["path"]).is_file():
                 return False
         for v in DbUploadStore(self.db, aid, self.cfg.bot_username, ws).files:
-            if v["status"] != COMPLETED and not Path(v["path"]).is_file():
+            if v["status"] != COMPLETED and not v.get("src_msg_id") and not Path(v["path"]).is_file():
                 return False
         return True
 
@@ -448,62 +445,51 @@ class Worker:
         return out
 
     async def _stage_extract(self, job: dict) -> None:
+        """Saved Messages ka batch: IMAGES download (ImgBB ke liye), VIDEOS download nahi (bot ko server-side forward)."""
         aid = job["archive_id"]
         fresh = self.repo.get(aid)  # latest
         info = fresh.get("extraction")
         if info is not None and (not self._media_needed(aid) or self._media_present(aid)):
-            return  # kaam ho chuka ya media disk par maujood hai
+            return  # kaam ho chuka ya images disk par maujood hain
+        if (fresh.get("kind") or job.get("kind")) != "media":
+            raise StagePermanent("ZIP jobs ab supported nahi hain (sirf Saved Messages ke image/video batch).")
+        if self.ports.download_media is None:
+            raise StagePermanent("Media download supported nahi hai (download_media port nahi).")
         dest = self._job_dir(aid) / "extracted"
         self.repo.transition(aid, DOWNLOADING)
-        if (fresh.get("kind") or job.get("kind")) == "media":  # File Manager me seedhe bheje image(s)+video(s): ZIP nahi
-            if self.ports.download_media is None:
-                raise StagePermanent("Media batch download supported nahi hai (download_media port nahi).")
-            shutil.rmtree(dest, ignore_errors=True)
-            raw = await self._retry(aid, "download", lambda: self._download(job, lambda j: self.ports.download_media(j, dest)))
-            self._check_stop()
-            self.repo.transition(aid, EXTRACTING)
-            res = ExtractionResult(files=await asyncio.to_thread(self._hash_media, raw, dest))
-            path = None
-        else:
-            await self.prefetcher.wait_for(aid)  # prefetch chal raha ho to poora hone do, phir download_zip file dekhkar skip kar dega
-            path = await self._retry(aid, "download", lambda: self._download(job))
-            self._check_stop()
-            self.repo.transition(aid, EXTRACTING)
-            shutil.rmtree(dest, ignore_errors=True)  # adhoori purani extraction hatao
-            try:
-                res = await asyncio.to_thread(self.ports.extract, path, dest, self.cfg.limits)
-            except (ArchiveRejected, ArchiveCorrupted) as e:
-                raise StagePermanent(f"{type(e).__name__}: {e}") from e
-            except InsufficientSpace as e:
-                raise StagePause(f"Disk space kam: {e}") from e
-        if info is None:  # pehli baar: fixed naam do (DiskWala/ImgBB ko yahi naam jayega)
-            n = rename_media(res.files, dest, self.cfg.video_name_base, self.cfg.image_name_base)
-            log.info("[%s] Rename: %s file(s) rename hue (VIDEO_NAME_BASE=%r, IMAGE_NAME_BASE=%r)%s", aid, n,
-                     self.cfg.video_name_base, self.cfg.image_name_base,
-                     "" if (self.cfg.video_name_base or self.cfg.image_name_base) else " - base khaali hai, rename BAND hai")
-        else:  # redeploy ke baad dobara download/extract: DB me jo naam/path saved hai wahi wapas rakho
+        shutil.rmtree(dest, ignore_errors=True)
+        raw = await self._retry(aid, "download", lambda: self._download(job, lambda j: self.ports.download_media(j, dest)))
+        self._check_stop()
+        self.repo.transition(aid, EXTRACTING)
+        local = [r for r in raw if not r.get("remote")]
+        remote = [r for r in raw if r.get("remote")]
+        res = ExtractionResult(files=await asyncio.to_thread(self._hash_media, local, dest))
+        if info is None:  # pehli baar: images ko fixed naam (video ka naam forward me badal nahi sakta)
+            n = rename_media(res.files, dest, "", self.cfg.image_name_base)
+            log.info("[%s] Rename: %s image(s) (IMAGE_NAME_BASE=%r). Videos forward hote hain: unka naam same rehta hai.",
+                     aid, n, self.cfg.image_name_base)
+        else:  # redeploy ke baad images dobara download: DB wale naam/path wapas
             ws, rdest = self.cfg.workspace.resolve(), dest.resolve()
             recorded = {}
-            for rec in DbImageStore(self.db, aid).files + DbUploadStore(self.db, aid, self.cfg.bot_username, ws).files:
+            for rec in DbImageStore(self.db, aid).files:
                 p = Path(rec["path"])
                 recorded[rec["file_id"]] = Path(os.path.relpath(p if p.is_absolute() else ws / p, rdest)).as_posix()
             restore_recorded_names(res.files, dest, recorded)
         files = [{**f, "path": f"{self._rel(dest)}/{f['relative_path']}"} for f in res.files]
-        arch = self._rel(path) if path else None  # media batch me ZIP file hoti hi nahi
+        videos = [{"file_id": f"msg{r['msg_id']}", "type": "video", "filename": r["name"], "size": int(r["size"]),
+                   "path": "", "src_msg_id": int(r["msg_id"]), "archive_id": aid} for r in remote]
         if info is None:
-            if not any(f["type"] in ("image", "video") for f in files):
-                raise StagePermanent("Is job me koi supported image/video nahi mila.")
-            self._register_media(aid, job, files)
+            if not files and not videos:
+                raise StagePermanent("Is batch me koi supported image/video nahi mila.")
+            self._register_media(aid, job, files, videos)
             self.repo.save_extraction(aid, {
-                "archive_path": arch, "dir": self._rel(dest),
-                "images": sum(f["type"] == "image" for f in files), "videos": sum(f["type"] == "video" for f in files),
-                "skipped": res.skipped_count})
-        else:  # re-extract: sizes DB se match hone chahiye
+                "archive_path": None, "dir": self._rel(dest), "images": len(files), "videos": len(videos), "skipped": 0})
+        else:  # re-download: image sizes DB se match hone chahiye
             sizes = {f["file_id"]: f["size"] for f in files}
-            for rec in DbImageStore(self.db, aid).files + DbUploadStore(self.db, aid, self.cfg.bot_username, self.cfg.workspace).files:
+            for rec in DbImageStore(self.db, aid).files:
                 if rec["file_id"] in sizes and sizes[rec["file_id"]] != rec["size"]:
-                    raise StagePermanent(f"Re-extract me {rec['filename']} ka size badal gaya.")
-            self.repo.save_extraction(aid, {**info, "archive_path": arch, "dir": self._rel(dest)})
+                    raise StagePermanent(f"Re-download me {rec['filename']} ka size badal gaya.")
+            self.repo.save_extraction(aid, {**info, "archive_path": None, "dir": self._rel(dest)})
 
     async def _download(self, job: dict, fn=None):
         try:
@@ -531,15 +517,12 @@ class Worker:
                 raise StageTransient(f"{type(e).__name__}: {e}") from e
             raise StagePause(f"Download fail: {type(e).__name__}: {e}") from e
 
-    def _register_media(self, aid: str, job: dict, files: list[dict]) -> None:
+    def _register_media(self, aid: str, job: dict, files: list[dict], videos: list[dict]) -> None:
+        """files = images (disk par), videos = remote (src_msg_id). Videos bada size pehle (message ke size se)."""
         manifest = {"archives": [{"archive_id": aid, "archive_filename": job["filename"], "message_id": job["message_id"],
                                   "status": "completed", "files": files, "extraction_dir": None}]}
         DbImageStore(self.db, aid).sync(collect_images(manifest))
-        vids = sort_videos(collect_videos(manifest))  # asli disk size ke hisaab se: bada pehle
-        ws = self.cfg.workspace
-        for v in vids:
-            v["size"] = (ws / v["path"]).stat().st_size
-        DbUploadStore(self.db, aid, self.cfg.bot_username, ws).sync(sort_videos(vids))
+        DbUploadStore(self.db, aid, self.cfg.bot_username, self.cfg.workspace).sync(sort_videos(videos))
 
     async def _stage_images(self, aid: str) -> None:
         if not DbImageStore(self.db, aid).select_for_upload(retry_failed=True):
