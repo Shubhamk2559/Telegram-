@@ -114,6 +114,10 @@ class UploadFailed(Exception):
     """Ek video fail - baaki chalte rahenge."""
 
 
+class SourceGone(UploadFailed):
+    """Source chat me video message delete ho chuka: retry bekaar, is video ko skip karna hai (queue nahi rukti)."""
+
+
 class FatalUpload(UploadFailed):
     """Poora batch rokna chahiye (account/bot level problem)."""
 
@@ -198,7 +202,7 @@ class TelethonBotChannel:
             raise UploadFailed("Source chat set nahi hai (forward nahi ho sakta).")
         msg = await self.client.get_messages(self.source, ids=int(msg_id))
         if not msg or not getattr(msg, "media", None):
-            raise UploadFailed(f"Source message {msg_id} ab nahi hai (delete ho gaya).")
+            raise SourceGone(f"Source message {msg_id} ab nahi hai (delete ho gaya).")
         if self.video_mode == "forward":
             sent = await self.client.forward_messages(self.entity, int(msg_id), from_peer=self.source)
         else:
@@ -426,6 +430,9 @@ class DiskWalaUploader:
                       error="Beech me roka gaya (Ctrl+C). Bot ko file mili ho sakti hai - chat check karo.")
             self._attribution_risk = True
             raise
+        except SourceGone as e:
+            st.update(rec, status=FAILED, error=str(e), finished_at=utc_now(), gone=True)
+            return FAILED
         except FatalUpload as e:
             self._fatal = str(e)
             st.update(rec, status=FAILED, error=str(e), finished_at=utc_now())
@@ -466,6 +473,8 @@ class DiskWalaUploader:
                     return await fwd(int(rec["src_msg_id"]))
                 return await self.channel.send_video(path, self.ui.progress)
             except asyncio.CancelledError:
+                raise
+            except SourceGone:
                 raise
             except Exception as e:  # noqa: BLE001
                 secs = flood_seconds(e)
