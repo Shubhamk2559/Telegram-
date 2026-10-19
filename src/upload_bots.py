@@ -110,12 +110,18 @@ class LazyBotChannel:
     def __init__(self, client, username: str, as_document: bool = True):
         self.client, self.username, self.as_document = client, username, as_document
         self._real = None
+        self.source = None          # app.py set karta hai
+        self.video_mode = "media"
 
     async def _ch(self):
         if self._real is None:
             from .diskwala_uploader import TelethonBotChannel
             self._real = await TelethonBotChannel.connect(self.client, self.username, self.as_document)
+        self._real.source, self._real.video_mode = self.source, self.video_mode
         return self._real
+
+    async def forward_video(self, msg_id: int) -> int:
+        return await (await self._ch()).forward_video(msg_id)
 
     async def latest_id(self) -> int:
         return await (await self._ch()).latest_id()
