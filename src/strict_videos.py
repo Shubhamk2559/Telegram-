@@ -10,12 +10,14 @@ Guarantees:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from .diskwala_uploader import DiskWalaUploader, Outcome, UploaderConfig
 from .posts import sort_videos
 from .upload_store import AWAITING, COMPLETED, FAILED, INTERRUPTED, PENDING, UPLOADING
 
+log = logging.getLogger("strict_videos")
 TRANSIENT_MARK = "Network/temporary error"
 
 
@@ -92,6 +94,12 @@ class StrictVideoUploader(DiskWalaUploader):
             self.store.update(rec, pre_send_latest_id=await self.channel.latest_id())
             status = await self.upload_one(rec)
             if status == COMPLETED:
+                return
+            if rec.get("gone"):  # source message delete: is video ko hata do, baaki aage badhein
+                log.warning("[%s] Source video delete ho chuka: skip kiya.", name)
+                drop = getattr(self.store, "drop", None)
+                if drop:
+                    drop(rec)
                 return
             if self._fatal:  # rate-limit / account level: resend bekaar
                 raise VideoBlocked(name, self._fatal)
