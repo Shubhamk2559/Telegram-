@@ -609,6 +609,9 @@ class Worker:
             await uploader.process_all(store.files)
         except VideoBlocked as e:
             raise StagePause(f"DiskWala: {e}") from e
+        else:
+            if not store.files and not DbImageStore(self.db, aid).files:
+                raise StagePermanent("Batch ke saare source messages delete ho chuke hain.")
         finally:
             if watcher is not None:  # sirf dekhne wala loop band; shuru ho chuka download chalta rehta hai (agle job ke liye)
                 watcher.cancel()
